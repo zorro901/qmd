@@ -3,17 +3,19 @@
 //! Layout (left/right panes):
 //!   ┌──────────────┬───────────────────────────┐
 //!   │ search box   │                           │
-//!   ├──────────────┤     note body / editor    │
-//!   │ note list    │                           │
-//!   └──────────────┴───────────────────────────┘
+//!   ├──────────────┤   note body / editor      │
+//!   │ note list    │   (inline edit w/ tui-    │
+//!   └──────────────┤    textarea)              │
+//!                  └───────────────────────────┘
 //!
 //! Keys:
 //!   /  or Ctrl-F   focus the search box
 //!   ↑ ↓            move through the note list
 //!   Enter          open the selected note in the right pane
-//!   e              edit the open note in $EDITOR, then reindex on exit
-//!   Ctrl-S         (same as `e`) save via external editor
-//!   Esc            leave search / clear / quit from root
+//!   e              edit the open note inline (tui-textarea)
+//!   Esc            leave search · cancel inline edit (discard) · quit from root
+//!   Ctrl-S         save the inline edit (write file + reindex)
+//!   Ctrl-R         reload the note list
 //!   q              quit
 //!
 //! All data goes through the `qmd` CLI (see qmd.rs); this TUI is a thin, fast
@@ -21,8 +23,7 @@
 
 mod qmd;
 
-use std::io::{self};
-use std::process::Command;
+use std::io;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -37,6 +38,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+use tui_textarea::{Input, TextArea};
 
 struct App {
     notes: Vec<qmd::Note>,
@@ -48,6 +50,8 @@ struct App {
     open_body: String,
     open_abs: Option<std::path::PathBuf>,
     dirty: bool,
+    edit_mode: bool,
+    textarea: TextArea<'static>,
 }
 
 impl App {
@@ -62,6 +66,8 @@ impl App {
             open_body: String::new(),
             open_abs: None,
             dirty: false,
+            edit_mode: false,
+            textarea: TextArea::default(),
         };
         app.reload_notes();
         app
@@ -125,7 +131,19 @@ impl App {
         }
     }
 
-    fn edit_external(&mut self) {
+    /// Load the open note into the inline editor.
+    fn start_edit(&mut self) {
+        if self.open_file.is_none() {
+            self.status = "open a note first (Enter), then press e to edit".into();
+            return;
+        }
+        self.textarea = TextArea::from(self.open_body.split('\n'));
+        self.edit_mode = true;
+        self.status = "editing — Ctrl-S save · Esc cancel".into();
+    }
+
+    /// Persist the inline edit: write the file, then reindex just that file.
+    fn save_edit(&mut self) {
         let abs = match &self.open_abs {
             Some(p) => p.clone(),
             None => {
@@ -133,32 +151,22 @@ impl App {
                 return;
             }
         };
-        // Suspend the TUI, hand control to $EDITOR, then reindex on return.
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-        disable_raw_mode().ok();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        let status = Command::new(&editor).arg(&abs).status();
-        let _ = execute!(io::stdout(), EnterAlternateScreen);
-        let _ = enable_raw_mode();
-
-        match status {
-            Ok(_) => {
-                // Re-read the file (in case the editor changed it) and reindex.
-                match qmd::save(&abs, &std::fs::read_to_string(&abs).unwrap_or_default()) {
-                    Ok(()) => {
-                        self.dirty = false;
-                        if let Ok((body, _)) = qmd::get_body(
-                            self.open_file.as_deref().unwrap_or(""),
-                        ) {
-                            self.open_body = body;
-                        }
-                        self.status = "saved & reindexed".into();
-                    }
-                    Err(e) => self.status = format!("reindex error: {e}"),
-                }
+        let content: String = self.textarea.lines().join("\n");
+        match qmd::save(&abs, &content) {
+            Ok(()) => {
+                self.open_body = content;
+                self.dirty = false;
+                self.edit_mode = false;
+                self.status = "saved & reindexed".into();
             }
-            Err(e) => self.status = format!("editor error: {e}"),
+            Err(e) => self.status = format!("save error: {e}"),
         }
+    }
+
+    /// Discard the inline edit and return to view mode.
+    fn cancel_edit(&mut self) {
+        self.edit_mode = false;
+        self.status = "edit discarded".into();
     }
 }
 
@@ -189,6 +197,21 @@ fn run_app<B: ratatui::backend::Backend>(
 
         if event::poll(std::time::Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                // Inline-edit mode captures keys for tui-textarea.
+                if app.edit_mode {
+                    match key.code {
+                        KeyCode::Esc => app.cancel_edit(),
+                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.save_edit()
+                        }
+                        _ => {
+                            app.textarea.input(Input::from(key));
+                            app.dirty = true;
+                        }
+                    }
+                    continue;
+                }
+
                 // Search input mode captures everything.
                 if app.searching {
                     match key.code {
@@ -212,9 +235,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('/') => app.searching = true,
-                    KeyCode::Char('e') => app.edit_external(),
+                    KeyCode::Char('e') => app.start_edit(),
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.edit_external()
+                        app.save_edit()
                     }
                     KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.searching = true
@@ -262,13 +285,16 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Span::raw(&app.search_input),
             Span::styled("_", Style::default().fg(Color::Yellow)),
         ])
+    } else if app.edit_mode {
+        Line::from(vec![Span::styled(
+            "editing — Ctrl-S save · Esc cancel",
+            Style::default().fg(Color::Green),
+        )])
     } else {
-        Line::from(vec![
-            Span::styled(
-                "press / to search",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
+        Line::from(vec![Span::styled(
+            "press / to search",
+            Style::default().fg(Color::DarkGray),
+        )])
     };
 
     let items: Vec<ListItem> = app
@@ -288,7 +314,7 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("qmd  [{search_line}]  {}", app.status)),
+                .title(format!("qmd  [{}]  {}", search_line, app.status)),
         )
         .highlight_style(
             Style::default()
@@ -302,22 +328,29 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let (title, text) = match &app.open_file {
+    let title = match &app.open_file {
         Some(file) => {
             let marker = if app.dirty { " ●" } else { "" };
-            (
-                format!(" {file}{marker} "),
-                Text::from(app.open_body.clone()),
-            )
+            format!(" {file}{marker} ")
         }
-        None => (
-            " no note open ".into(),
-            Text::from("Select a note on the left, then press Enter to open it.\n\nKeys: / search · ↑↓ move · Enter open · e edit ($EDITOR) · Ctrl-S save · q quit"),
-        ),
+        None => " no note open ".into(),
     };
+    let block = Block::default().borders(Borders::ALL).title(title);
 
-    let para = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .scroll((0, 0));
-    f.render_widget(para, area);
+    if app.edit_mode {
+        // Inline editor: render the textarea with the same border/title.
+        let mut ta = app.textarea.clone();
+        ta.set_block(block);
+        f.render_widget(ta.widget(), area);
+    } else {
+        let text = match &app.open_file {
+            Some(_) => Text::from(app.open_body.clone()),
+            None => Text::from(
+                "Select a note on the left, then press Enter to open it.\n\n\
+                 Keys: / search · ↑↓ move · Enter open · e edit inline · Ctrl-S save · q quit",
+            ),
+        };
+        let para = Paragraph::new(text).block(block);
+        f.render_widget(para, area);
+    }
 }

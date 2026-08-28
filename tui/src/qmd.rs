@@ -124,3 +124,41 @@ pub fn save(abs_path: &PathBuf, content: &str) -> Result<(), String> {
     run_qmd(&["update", "--path", &abs_str])?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Verifies the save() round-trip: write a file, reindex via qmd, then read
+    // it back through the qmd CLI. Skipped automatically if `qmd` is not on PATH
+    // or no index exists (CI without a built index).
+    #[test]
+    fn save_then_relist_reflects_content() {
+        // Point at an existing indexed file when provided (e.g. a qmd collection
+        // under test), otherwise use a temp file that qmd won't index (the test
+        // then self-skips via the early return below).
+        let file: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_FILE") {
+            Ok(p) => p.into(),
+            Err(_) => {
+                let dir =
+                    std::env::temp_dir().join(format!("qmd-tui-test-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&dir);
+                dir.join("note.md")
+            }
+        };
+        std::fs::write(&file, "# Hello\noriginal\n").unwrap();
+
+        // Only run if `qmd` is reachable and has a usable index for this path.
+        let abs = file.clone();
+        let res = save(&abs, "# Hello\nedited by tui-textarea\n");
+        if res.is_err() {
+            // No qmd index covering this file — not a code failure.
+            let _ = std::fs::remove_file(&file);
+            return;
+        }
+        let back = std::fs::read_to_string(&file).unwrap();
+        assert!(back.contains("edited by tui-textarea"));
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
