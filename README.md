@@ -71,6 +71,37 @@ qmd search "API" -c notes
 qmd search "API" --all --files --min-score 0.3
 ```
 
+### Terminal UI (`qmd tui`)
+
+A SimpleNote-style terminal UI runs over SSH as a thin front-end over the `qmd`
+CLI (Rust + ratatui, in `tui/`). It shells out to `qmd` for every read and
+write, so files stay the single source of truth. Build it once, then launch:
+
+```sh
+cd tui && cargo build --release   # stages bin/qmd-tui; also done by `npm run build`
+qmd tui                            # or set QMD_TUI_BIN to a custom binary
+```
+
+**Keys**
+
+| Key | Action |
+|-----|--------|
+| `/` or `Ctrl-F` | Focus search (filters live as you type) |
+| `↑` / `↓` | Move through the note list |
+| `Enter` | Open the selected note in the right pane |
+| `c` | Switch collection (filters the list and search) |
+| `n` | Create a new note |
+| `e` | Edit the open note inline (tui-textarea) |
+| `Ctrl-S` | Save the inline edit (write file + reindex) |
+| `PgUp` / `PgDn`, `Home` / `End`, mouse wheel | Scroll the note body |
+| `Ctrl-R` | Reload the note list |
+| `?` | Show keybindings |
+| `Esc` | Cancel search / discard edit (asks if unsaved) / close overlay |
+| `q` | Quit (asks if there are unsaved changes) |
+
+Search matches are highlighted in the list, and the active collection shows in
+the list title.
+
 ### Using with AI Agents
 
 QMD's `--json` and `--files` output formats are designed for agentic workflows:
