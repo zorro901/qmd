@@ -15,6 +15,7 @@
 //!   c              switch collection (filter the list/notes)
 //!   ?              show keybindings
 //!   n              create a new note (enter "<collection>/<file>.md")
+//!   r              rename / move the selected note ("<collection>/<file>.md")
 //!   e              edit the open note inline (tui-textarea)
 //!   d              delete the selected note (asks to confirm)
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
@@ -76,6 +77,12 @@ struct App {
     textarea: TextArea<'static>,
     creating: bool,
     new_input: String,
+    /// When true, the rename/move filename prompt is active (edits go to
+    /// `rename_input`). `r` arms this for the selected note.
+    renaming: bool,
+    rename_input: String,
+    /// The note id being renamed (the original, before the move).
+    rename_from: Option<String>,
     /// When set, the next Enter/yes confirms a destructive action and any other
     /// key (e.g. the same `q`/Esc) cancels it. Prevents silent data loss.
     confirm_pending: Option<Confirm>,
@@ -111,6 +118,9 @@ impl App {
             textarea: TextArea::default(),
             creating: false,
             new_input: String::new(),
+            renaming: false,
+            rename_input: String::new(),
+            rename_from: None,
             confirm_pending: None,
             vertical_scroll: 0,
             query: String::new(),
@@ -401,6 +411,68 @@ impl App {
         }
     }
 
+    /// Begin renaming/moving the selected note. Prefills the prompt with the
+    /// note's current id so the user can edit just the filename or the whole
+    /// "<collection>/<path>" target.
+    fn start_rename(&mut self) {
+        let idx = match self.list_state.selected() {
+            Some(i) => i,
+            None => {
+                self.status = "select a note first, then press r to rename".into();
+                return;
+            }
+        };
+        let note = match self.notes.get(idx) {
+            Some(n) => n.clone(),
+            None => {
+                self.status = "select a note first, then press r to rename".into();
+                return;
+            }
+        };
+        self.renaming = true;
+        self.rename_from = Some(note.file.clone());
+        self.rename_input = note.file.clone();
+        self.status = "rename — edit target, Enter to apply".into();
+    }
+
+    /// Finish the rename/move prompt: move the file on disk and reindex both
+    /// affected collections. Refuses to overwrite an existing destination.
+    fn confirm_rename(&mut self) {
+        let raw = self.rename_input.trim().to_string();
+        let from = match self.rename_from.take() {
+            Some(f) => f,
+            None => {
+                self.renaming = false;
+                return;
+            }
+        };
+        self.renaming = false;
+        self.rename_input.clear();
+        if raw.is_empty() || raw == from {
+            self.status = "rename cancelled".into();
+            return;
+        }
+        match qmd::rename_note(&from, &raw) {
+            Ok(()) => {
+                self.status = format!("renamed to {raw}");
+                // If the moved note was open, point the open pane at the new id.
+                if self.open_file.as_deref() == Some(&from) {
+                    self.open_file = Some(raw.clone());
+                    // open_abs is now stale; refresh it via multi-get.
+                    if let Ok((_, abs)) = qmd::get_body(&raw) {
+                        self.open_abs = abs;
+                    }
+                }
+                self.reload_notes();
+                // Keep the renamed note selected in the list if still present.
+                if let Some(idx) = self.notes.iter().position(|n| &n.file == &raw) {
+                    self.list_state.select(Some(idx));
+                }
+            }
+            Err(e) => self.status = format!("rename error: {e}"),
+        }
+    }
+
     /// Persist the inline edit: write the file, then reindex just that file.
     fn save_edit(&mut self) {
         let abs = match &self.open_abs {
@@ -565,6 +637,25 @@ impl App {
             return false;
         }
 
+        // Rename/move prompt captures keys.
+        if self.renaming {
+            match key.code {
+                KeyCode::Enter => self.confirm_rename(),
+                KeyCode::Esc => {
+                    self.renaming = false;
+                    self.rename_from = None;
+                    self.rename_input.clear();
+                    self.status = "cancelled".into();
+                }
+                KeyCode::Char(c) => self.rename_input.push(c),
+                KeyCode::Backspace => {
+                    self.rename_input.pop();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         match key.code {
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('/') => self.searching = true,
@@ -573,6 +664,7 @@ impl App {
             KeyCode::Char('d') => self.arm_delete(),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('n') => self.start_create(),
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => self.start_rename(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => self.save_edit(),
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.searching = true
@@ -782,6 +874,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("↑ ↓ / j k", "move through the note list (g top · G bottom)"),
     ("c", "switch collection (filter list + search)"),
     ("n", "create a new note"),
+    ("r", "rename / move the selected note (cross-collection)"),
     ("e", "edit the open note inline"),
     ("d", "delete the selected note (asks)"),
     ("Ctrl-S", "save the inline edit (write + reindex)"),
@@ -842,6 +935,12 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Span::styled("new › ", Style::default().fg(Color::Cyan)),
             Span::raw(&app.new_input),
             Span::styled("_", Style::default().fg(Color::Cyan)),
+        ])
+    } else if app.renaming {
+        Line::from(vec![
+            Span::styled("rename › ", Style::default().fg(Color::Magenta)),
+            Span::raw(&app.rename_input),
+            Span::styled("_", Style::default().fg(Color::Magenta)),
         ])
     } else {
         Line::from(vec![Span::styled(
@@ -1019,6 +1118,72 @@ mod app_tests {
         // Clean up: remove the file and reindex so the index stays consistent.
         let _ = std::fs::remove_file(&abs);
         let _ = qmd::save(&abs, "");
+    }
+
+    // Rename/move flow: create a note, then rename it within its collection via
+    // r -> Enter. Verifies the note reappears under the new id and is gone from
+    // the old id in the qmd index. Skips without a usable indexed collection.
+    #[test]
+    fn rename_moves_note_in_index() {
+        let dir: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
+            Ok(d) => d.into(),
+            Err(_) => return,
+        };
+        // Find the collection name whose directory matches the test dir.
+        let colls = match qmd::list_collections() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let coll = match colls
+            .iter()
+            .find(|(_, p)| p == &dir)
+            .map(|(n, _)| n.clone())
+        {
+            Some(n) => n,
+            None => return,
+        };
+        let base = format!("qmd-tui-ren-{}.md", std::process::id());
+        let old_id = format!("{}/{}", coll, base);
+        let abs = match qmd::create_note(&dir, &base, "# rename me\n") {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+
+        let mut app = App::new();
+        let idx = match app.notes.iter().position(|n| n.file == old_id) {
+            Some(i) => i,
+            None => {
+                let _ = std::fs::remove_file(&abs);
+                let _ = qmd::save(&abs, "");
+                return;
+            }
+        };
+        app.list_state.select(Some(idx));
+
+        // 'r' arms the rename prompt pre-filled with the current id.
+        app.handle_key(key('r'));
+        assert!(app.renaming, "rename prompt arms on r");
+        assert_eq!(app.rename_from.as_deref(), Some(old_id.as_str()));
+        // Esc cancels without touching the file.
+        app.handle_key(key_esc());
+        assert!(!app.renaming, "esc cancels rename prompt");
+
+        // Re-arm and apply a new id.
+        app.list_state.select(Some(idx));
+        app.handle_key(key('r'));
+        let new_id = format!("{}/qmd-tui-ren-{}-new.md", coll, std::process::id());
+        app.rename_input = new_id.clone();
+        app.confirm_rename();
+        assert!(!app.renaming, "rename prompt closed after apply");
+
+        let listed = qmd::list_notes(Some(&coll)).unwrap_or_default();
+        let under_new = listed.iter().any(|n| n.file == new_id);
+        let under_old = listed.iter().any(|n| n.file == old_id);
+        assert!(under_new, "note present under new id after rename");
+        assert!(!under_old, "note gone from old id after rename");
+
+        // Clean up the moved file.
+        let _ = qmd::delete_note(&new_id);
     }
 
     // Quit with unsaved edits must NOT exit (handle_key returns false); a second

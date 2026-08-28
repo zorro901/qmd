@@ -152,6 +152,59 @@ pub fn delete_note(file: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Rename / move a note. `from` and `to` are qmd note ids
+/// ("collection/path.md"). The file is moved on disk (refusing to overwrite an
+/// existing destination), then both the source and destination collections are
+/// reindexed with `qmd update -c <name>` so the move is reflected in search.
+pub fn rename_note(from: &str, to: &str) -> Result<(), String> {
+    // Resolve the source absolute path via multi-get --full-path.
+    let (_, abs) = get_body(from)?;
+    let src_abs = match abs {
+        Some(p) => p,
+        None => return Err(format!("could not resolve path for {from}")),
+    };
+    // Parse the destination "<collection>/<path>".
+    let (coll, rel) = match to.split_once('/') {
+        Some((c, p)) if !c.is_empty() && !p.is_empty() => (c.to_string(), p.to_string()),
+        _ => return Err("use '<collection>/<path>.md' format".into()),
+    };
+    let file_name = if rel.ends_with(".md") {
+        rel
+    } else {
+        format!("{rel}.md")
+    };
+    // Destination collection directory.
+    let colls = list_collections()?;
+    let dst_dir = match colls.iter().find(|(n, _)| n == &coll) {
+        Some((_, p)) => p.clone(),
+        None => return Err(format!("unknown collection '{coll}'")),
+    };
+    let dst_abs = dst_dir.join(&file_name);
+    if dst_abs.exists() {
+        return Err(format!("destination already exists: {to}"));
+    }
+    if let Some(parent) = dst_abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
+    }
+    std::fs::rename(&src_abs, &dst_abs).map_err(|e| format!("rename failed: {e}"))?;
+    // Reindex affected collections: drop the old path from the source collection
+    // and index the new path in the destination collection.
+    let src_coll = from
+        .split('/')
+        .next()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| format!("malformed note id: {from}"))?;
+    let mut to_update: Vec<&str> = Vec::new();
+    if src_coll != coll {
+        to_update.push(src_coll);
+    }
+    to_update.push(&coll);
+    for c in to_update {
+        run_qmd(&["update", "-c", c])?;
+    }
+    Ok(())
+}
+
 /// Write `content` to `abs_path`, then reindex just that file via
 /// `qmd update --path <abs>` (O(changed), no full rescan).
 pub fn save(abs_path: &PathBuf, content: &str) -> Result<(), String> {
