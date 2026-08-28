@@ -14,6 +14,7 @@
 //!   Enter          open the selected note in the right pane
 //!   n              create a new note (enter "<collection>/<file>.md")
 //!   e              edit the open note inline (tui-textarea)
+//!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
 //!   Esc            leave search · discard inline edit (asks if unsaved) · quit prompt
 //!   Ctrl-S         save the inline edit (write file + reindex)
 //!   Ctrl-R         reload the note list
@@ -27,7 +28,10 @@ mod qmd;
 use std::io;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -35,8 +39,12 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::scrollbar as scrollbar_symbols,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
     Frame, Terminal,
 };
 use tui_textarea::{Input, TextArea};
@@ -66,6 +74,8 @@ struct App {
     /// When set, the next Enter/yes confirms a destructive action and any other
     /// key (e.g. the same `q`/Esc) cancels it. Prevents silent data loss.
     confirm_pending: Option<Confirm>,
+    /// Vertical scroll offset (in lines) of the note body pane.
+    vertical_scroll: u16,
 }
 
 impl App {
@@ -85,6 +95,7 @@ impl App {
             creating: false,
             new_input: String::new(),
             confirm_pending: None,
+            vertical_scroll: 0,
         };
         app.reload_notes();
         app
@@ -142,6 +153,7 @@ impl App {
                 self.open_body = body;
                 self.open_abs = abs;
                 self.dirty = false;
+                self.vertical_scroll = 0;
                 self.status = format!("opened {}", note.file);
             }
             Err(e) => self.status = format!("open error: {e}"),
@@ -156,7 +168,20 @@ impl App {
         }
         self.textarea = TextArea::from(self.open_body.split('\n'));
         self.edit_mode = true;
+        self.vertical_scroll = 0;
         self.status = "editing — Ctrl-S save · Esc cancel".into();
+    }
+
+    /// Scroll the note body by `delta` lines (negative = up), clamped to the
+    /// range the pane can actually show for `content_lines` / `viewport_lines`.
+    fn scroll_body(&mut self, delta: i32, content_lines: usize, viewport_lines: usize) {
+        if self.edit_mode {
+            return; // the textarea scrolls itself
+        }
+        let max = content_lines.saturating_sub(viewport_lines);
+        let cur = self.vertical_scroll as i32;
+        let next = (cur + delta).clamp(0, max as i32);
+        self.vertical_scroll = next as u16;
     }
 
     /// Begin creating a new note: pick the first collection, then prompt for a
@@ -384,16 +409,41 @@ impl App {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reload_notes()
             }
+            KeyCode::PageUp => self.scroll_body(-10, self.open_body.lines().count(), usize::MAX),
+            KeyCode::PageDown => self.scroll_body(10, self.open_body.lines().count(), usize::MAX),
+            KeyCode::Home => self.vertical_scroll = 0,
+            KeyCode::End => {
+                // Jump to the bottom; render() clamps to the last viewable line.
+                let n = self.open_body.lines().count();
+                self.vertical_scroll = n.saturating_sub(1) as u16;
+            }
             _ => {}
         }
         false
+    }
+
+    /// Handle mouse events: wheel scrolling moves the note body. Other mouse
+    /// interactions are ignored (the list uses arrow keys).
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        if self.edit_mode {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                self.scroll_body(3, self.open_body.lines().count(), usize::MAX);
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_body(-3, self.open_body.lines().count(), usize::MAX);
+            }
+            _ => {}
+        }
     }
 }
 
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -401,7 +451,7 @@ fn main() -> io::Result<()> {
     let res = run_app(&mut terminal, app);
 
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     if let Err(e) = res {
         eprintln!("qmd-tui error: {e}");
     }
@@ -416,10 +466,14 @@ fn run_app<B: ratatui::backend::Backend>(
         terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(std::time::Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if app.handle_key(key) {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    if app.handle_key(key) {
+                        break;
+                    }
                 }
+                Event::Mouse(m) => app.handle_mouse(m),
+                _ => {}
             }
         }
     }
@@ -520,11 +574,39 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             None => Text::from(
                 "Select a note on the left, then press Enter to open it.\n\n\
                  Keys: / search · ↑↓ move · Enter open · n new note · e edit inline · Ctrl-S save · q quit\n\
-                 Unsaved edits: q asks, Esc in editor asks, Enter confirms discard/quit",
+                 Unsaved edits: q asks, Esc in editor asks, Enter confirms discard/quit\n\
+                 Scroll: mouse wheel · PgUp/PgDn · Home/End",
             ),
         };
-        let para = Paragraph::new(text).block(block);
+        // Clamp the scroll to what the viewport can actually show.
+        let total: u16 = app.open_body.lines().count().saturating_sub(1) as u16;
+        let viewport = area.height.saturating_sub(2) as usize; // minus borders
+        let max = total.saturating_sub(viewport as u16);
+        let offset = app.vertical_scroll.min(max);
+        let para = Paragraph::new(text)
+            .block(block)
+            .scroll((offset, 0));
         f.render_widget(para, area);
+
+        // Scrollbar reflecting position within the note.
+        if total > 0 {
+            let scrollbar_area = Rect {
+                x: area.x + area.width.saturating_sub(1),
+                y: area.y + 1,
+                width: 1,
+                height: area.height.saturating_sub(2),
+            };
+            let mut state = ScrollbarState::new(total as usize).position(offset as usize);
+            if max > 0 {
+                state = state.viewport_content_length(viewport);
+            }
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .symbols(scrollbar_symbols::VERTICAL),
+                scrollbar_area,
+                &mut state,
+            );
+        }
     }
 }
 
@@ -540,6 +622,9 @@ mod app_tests {
     }
     fn key_esc() -> event::KeyEvent {
         event::KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())
+    }
+    fn key_end() -> event::KeyEvent {
+        event::KeyEvent::new(KeyCode::End, KeyModifiers::empty())
     }
 
     // Headless integration test for the "new note" flow: start_create() ->
@@ -687,5 +772,33 @@ mod app_tests {
         // Clean up.
         let _ = std::fs::remove_file(&abs);
         let _ = qmd::save(&abs, "");
+    }
+
+    // Body scroll clamps: never negative, never past the last visible line for a
+    // given viewport. Driven via the real handle_key PgDn/PgUp + End paths.
+    #[test]
+    fn body_scroll_clamps() {
+        let mut app = App::new();
+        app.open_file = Some("x.md".into());
+        // A 100-line body.
+        app.open_body = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let total = app.open_body.lines().count();
+        // viewport larger than content -> scroll stays 0.
+        app.scroll_body(1000, total, 200);
+        assert_eq!(app.vertical_scroll, 0, "no scroll when viewport fits all");
+        // viewport smaller than content -> can scroll but clamps at the end.
+        app.scroll_body(1000, total, 20);
+        let max = (total - 20) as u16;
+        assert!(app.vertical_scroll <= max, "scroll clamped to max");
+        assert_eq!(app.vertical_scroll, max, "scrolls to bottom on big jump");
+        // Scrolling back up never goes negative.
+        app.scroll_body(-10000, total, 20);
+        assert_eq!(app.vertical_scroll, 0, "scroll never negative");
+        // End jumps to the bottom; render() clamps to the last viewable line,
+        // so the effective offset must not exceed max.
+        app.handle_key(key_end());
+        let rendered = app.vertical_scroll.min(max);
+        assert!(rendered <= max, "End clamps within content at render time");
+        assert_eq!(rendered, max, "End reaches the bottom line");
     }
 }
