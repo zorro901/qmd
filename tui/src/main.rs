@@ -10,7 +10,7 @@
 //!
 //! Keys:
 //!   /  or Ctrl-F   focus the search box
-//!   ↑ ↓  or  j k    move through the note list (g = top, G = bottom)
+//!   ↑ ↓  or  j k    move through the note list; the body previews as you go (g = top, G = bottom)
 //!   Enter          open the selected note in the right pane
 //!   c              switch collection (filter the list/notes)
 //!   ?              show keybindings
@@ -131,6 +131,12 @@ impl App {
             show_help: false,
         };
         app.reload_notes();
+        // Open the first note so the right pane is populated immediately
+        // (SimpleNote-style preview without an explicit Enter).
+        if !app.notes.is_empty() {
+            app.list_state.select(Some(0));
+            app.preview_selected();
+        }
         app
     }
 
@@ -150,6 +156,23 @@ impl App {
                 }
                 if self.list_state.selected().is_none() && !self.notes.is_empty() {
                     self.list_state.select(Some(0));
+                }
+                // Keep previewing the open note if it is still in the (refreshed)
+                // list; otherwise preview whatever is now selected so the right
+                // pane is never left pointing at a stale note.
+                if self
+                    .open_file
+                    .as_ref()
+                    .map(|f| self.notes.iter().any(|n| &n.file == f))
+                    .unwrap_or(false)
+                {
+                    // already showing a note that survived the reload
+                } else if !self.notes.is_empty() {
+                    self.preview_selected();
+                } else {
+                    self.open_file = None;
+                    self.open_body.clear();
+                    self.open_abs = None;
                 }
             }
             Err(e) => self.status = format!("error: {e}"),
@@ -249,9 +272,40 @@ impl App {
         }
     }
 
+    /// Load the currently-selected note into the right pane (preview), unless it
+    /// is already open or we are editing inline. Called whenever the selection
+    /// changes so the body follows the cursor (SimpleNote-style) without an
+    /// explicit Enter. No-op when nothing is selected or already shown.
+    fn preview_selected(&mut self) {
+        if self.edit_mode {
+            return;
+        }
+        let idx = match self.list_state.selected() {
+            Some(i) => i,
+            None => return,
+        };
+        let note = match self.notes.get(idx) {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        if self.open_file.as_deref() == Some(&note.file) {
+            return; // already showing this note
+        }
+        match qmd::get_body(&note.file) {
+            Ok((body, abs)) => {
+                self.open_file = Some(note.file.clone());
+                self.open_body = body;
+                self.open_abs = abs;
+                self.dirty = false;
+                self.vertical_scroll = 0;
+            }
+            Err(e) => self.status = format!("open error: {e}"),
+        }
+    }
+
     /// Move the list selection by `delta` rows (negative = up), clamped to the
-    /// list bounds. No-op when the list is empty. Shared by the arrow keys and
-    /// the vim-style `j`/`k` bindings.
+    /// list bounds, then preview the newly selected note in the body. No-op when
+    /// the list is empty. Shared by the arrow keys and the vim-style `j`/`k`.
     fn move_selection(&mut self, delta: isize) {
         if self.notes.is_empty() {
             return;
@@ -260,6 +314,7 @@ impl App {
         let len = self.notes.len() as isize;
         let next = (i as isize + delta).clamp(0, len - 1) as usize;
         self.list_state.select(Some(next));
+        self.preview_selected();
     }
 
     /// Arm a deletion confirmation for the selected note. Deletion is destructive
@@ -675,11 +730,13 @@ impl App {
             KeyCode::Char('g') => {
                 if !self.notes.is_empty() {
                     self.list_state.select(Some(0));
+                    self.preview_selected();
                 }
             }
             KeyCode::Char('G') => {
                 if !self.notes.is_empty() {
                     self.list_state.select(Some(self.notes.len() - 1));
+                    self.preview_selected();
                 }
             }
             KeyCode::Down => self.move_selection(1),
@@ -871,7 +928,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("/", "focus the search box (live, as you type)"),
     ("Ctrl-F", "focus the search box"),
     ("Enter", "open the selected note"),
-    ("↑ ↓ / j k", "move through the note list (g top · G bottom)"),
+    ("↑ ↓ / j k", "move through the note list; the body previews as you go (g top · G bottom)"),
     ("c", "switch collection (filter list + search)"),
     ("n", "create a new note"),
     ("r", "rename / move the selected note (cross-collection)"),
@@ -1246,6 +1303,41 @@ mod app_tests {
         assert_eq!(app.list_state.selected(), Some(1), "Down == j");
         app.handle_key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
         assert_eq!(app.list_state.selected(), Some(0), "Up == k");
+    }
+
+    // App::new loads the index and immediately previews the first note, so the
+    // right pane is populated without an explicit Enter (SimpleNote style).
+    #[test]
+    fn app_new_previews_first_note() {
+        let app = App::new();
+        if app.notes.is_empty() {
+            return; // no index to preview against in this environment
+        }
+        assert!(app.open_file.is_some(), "first note should be previewed on load");
+        assert_eq!(
+            app.open_file.as_deref(),
+            Some(app.notes[0].file.as_str()),
+            "previewed note matches first list entry"
+        );
+    }
+
+    // preview_selected is a no-op when the selected note is already open, so
+    // moving the cursor back onto the open note never re-fetches or clobbers it.
+    #[test]
+    fn preview_skips_when_already_open() {
+        let mut app = App::new();
+        // A synthetic list whose id won't resolve via qmd: if preview_selected
+        // actually fetched, the body would change, proving the skip guard fired.
+        app.notes = vec![qmd::Note {
+            file: "t/never-resolved.md".into(),
+            title: "sentinel".into(),
+            mtime: String::new(),
+        }];
+        app.list_state.select(Some(0));
+        app.open_file = Some("t/never-resolved.md".into());
+        app.open_body = "SENTINEL".into();
+        app.preview_selected();
+        assert_eq!(app.open_body, "SENTINEL", "already-open note is not re-fetched");
     }
 
     // Esc while editing dirty content arms a discard prompt; Enter discards.
