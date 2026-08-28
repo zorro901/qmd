@@ -38,7 +38,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     symbols::scrollbar as scrollbar_symbols,
     text::{Line, Span, Text},
     widgets::{
@@ -76,6 +76,8 @@ struct App {
     confirm_pending: Option<Confirm>,
     /// Vertical scroll offset (in lines) of the note body pane.
     vertical_scroll: u16,
+    /// Last executed search query, used to highlight matches in the list.
+    query: String,
 }
 
 impl App {
@@ -96,6 +98,7 @@ impl App {
             new_input: String::new(),
             confirm_pending: None,
             vertical_scroll: 0,
+            query: String::new(),
         };
         app.reload_notes();
         app
@@ -105,6 +108,7 @@ impl App {
         match qmd::list_notes() {
             Ok(notes) => {
                 self.notes = notes;
+                self.query = String::new();
                 if self.notes.is_empty() {
                     self.status = "no notes — run 'qmd collection add .' then 'qmd update'".into();
                 } else {
@@ -124,6 +128,7 @@ impl App {
             self.reload_notes();
             return;
         }
+        self.query = q.to_lowercase();
         match qmd::search(q) {
             Ok(notes) => {
                 self.notes = notes;
@@ -490,6 +495,33 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     render_body(f, app, chunks[1]);
 }
 
+/// Split `text` into spans, highlighting (yellow, bold) every case-insensitive
+/// occurrence of `query`. When `query` is empty, returns a single plain span.
+fn highlight(text: &str, query: &str) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return vec![Span::raw(text.to_string())];
+    }
+    let lower = text.to_lowercase();
+    let q = query.to_lowercase();
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while let Some(idx) = lower[start..].find(&q) {
+        let hit = start + idx;
+        if hit > start {
+            spans.push(Span::raw(text[start..hit].to_string()));
+        }
+        let end = hit + q.len();
+        spans.push(
+            Span::styled(text[hit..end].to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        );
+        start = end;
+    }
+    if start < text.len() {
+        spans.push(Span::raw(text[start..].to_string()));
+    }
+    spans
+}
+
 fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let search_line = if app.searching {
         Line::from(vec![
@@ -521,11 +553,16 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|n| {
             let title = if n.title.is_empty() { &n.file } else { &n.title };
             let is_open = matches!(&app.open_file, Some(f) if f == &n.file);
-            let mut spans = vec![
-                Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(&n.file, Style::default().fg(Color::DarkGray)),
-            ];
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            // Bold title with query matches highlighted.
+            for s in highlight(title, &app.query) {
+                spans.push(s.add_modifier(Modifier::BOLD));
+            }
+            spans.push(Span::raw("  "));
+            // File path with query matches highlighted (dimmer base color).
+            for s in highlight(&n.file, &app.query) {
+                spans.push(s.fg(Color::DarkGray));
+            }
             if is_open {
                 spans.push(Span::styled(
                     "  ◀ open",
@@ -801,4 +838,55 @@ mod app_tests {
         assert!(rendered <= max, "End clamps within content at render time");
         assert_eq!(rendered, max, "End reaches the bottom line");
     }
+
+    // highlight() wraps every case-insensitive occurrence of the query in its
+    // own span, leaving the rest unchanged, and returns a single plain span
+    // when there is no query.
+    #[test]
+    fn query_highlight_wraps_matches() {
+        // No query -> single raw span, full text preserved.
+        let spans = highlight("Hello World", "");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "Hello World");
+
+        // One match, mid-string, case-insensitive.
+        let spans = highlight("Note about RUST and rust again", "rust");
+        // "Note about " + "RUST" + " and " + "rust" + " again" = 5 spans.
+        assert_eq!(spans.len(), 5);
+        assert_eq!(spans[0].content, "Note about ");
+        assert_eq!(spans[1].content, "RUST");
+        assert_eq!(spans[3].content, "rust");
+        assert_eq!(spans[4].content, " again");
+
+        // No match -> single raw span.
+        let spans = highlight("nothing here", "xyz");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "nothing here");
+    }
+
+    // run_search stores a lowercased query for highlighting; a non-empty list
+    // of notes (from a real index) keeps the query, while reload_notes clears
+    // it so normal list rendering shows no highlights.
+    #[test]
+    fn run_search_sets_query() {
+        let mut app = App::new();
+        // No query -> behaves like reload, query stays empty.
+        app.search_input = "   ".into();
+        app.query = "leftover".into();
+        app.run_search();
+        assert_eq!(app.query, "", "empty search clears the query");
+
+        // Non-empty query is stored (lower-cased) and survives until a reload.
+        app.search_input = "PROJECT".into();
+        app.query = String::new();
+        // If there is no usable index this simply won't error; the query is set
+        // before the search call so it is always populated here.
+        app.run_search();
+        assert_eq!(app.query, "project", "query is stored lower-cased");
+
+        // A reload (e.g. Ctrl-R or post-save) clears the highlight query.
+        app.reload_notes();
+        assert_eq!(app.query, "", "reload clears the highlight query");
+    }
 }
+
