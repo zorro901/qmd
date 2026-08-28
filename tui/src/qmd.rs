@@ -27,8 +27,8 @@ struct NotesJson {
 struct MultiGetJson {
     #[serde(default)]
     body: String,
-    #[serde(default, rename = "fsPath")]
-    fs_path: Option<String>,
+    #[serde(default)]
+    file: String, // absolute on-disk path when --full-path is passed
 }
 
 /// Resolve the `qmd` binary. Prefer `qmd` on PATH; fall back to the repo's
@@ -103,8 +103,8 @@ pub fn search(query: &str, collection: Option<&str>) -> Result<Vec<Note>, String
         .collect())
 }
 
-/// Fetch a note's body. Uses `qmd multi-get --full-path` so we also learn the
-/// on-disk absolute path (needed for saving + reindex).
+/// Fetch a note's body. Uses `qmd multi-get --full-path` so the `file`
+/// field carries the on-disk absolute path (needed for saving + deleting).
 pub fn get_body(file: &str) -> Result<(String, Option<PathBuf>), String> {
     let raw = run_qmd(&[
         "multi-get",
@@ -120,8 +120,36 @@ pub fn get_body(file: &str) -> Result<(String, Option<PathBuf>), String> {
         .into_iter()
         .next()
         .ok_or_else(|| format!("note not found: {file}"))?;
-    let abs = first.fs_path.as_ref().map(PathBuf::from);
+    // With --full-path the `file` field is the absolute on-disk path.
+    let abs = if first.file.starts_with('/') {
+        Some(PathBuf::from(&first.file))
+    } else {
+        None
+    };
     Ok((first.body, abs))
+}
+
+/// Delete a note file and reindex its collection so it disappears from search.
+/// `file` is the qmd note id ("collection/path.md"); the on-disk path is
+/// resolved via `qmd multi-get --full-path`. The collection is reindexed with
+/// `qmd update -c <name>`, which drops the now-missing file from the index.
+pub fn delete_note(file: &str) -> Result<(), String> {
+    // Resolve the absolute path.
+    let (_, abs) = get_body(file)?;
+    let abs = match abs {
+        Some(p) => p,
+        None => return Err(format!("could not resolve path for {file}")),
+    };
+    std::fs::remove_file(&abs).map_err(|e| format!("delete failed: {e}"))?;
+    // Reindex the owning collection (cheaper than a full update). The collection
+    // name is the first path segment of the note id.
+    let coll = file
+        .split('/')
+        .next()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| format!("malformed note id: {file}"))?;
+    run_qmd(&["update", "-c", coll])?;
+    Ok(())
 }
 
 /// Write `content` to `abs_path`, then reindex just that file via

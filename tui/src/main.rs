@@ -16,6 +16,7 @@
 //!   ?              show keybindings
 //!   n              create a new note (enter "<collection>/<file>.md")
 //!   e              edit the open note inline (tui-textarea)
+//!   d              delete the selected note (asks to confirm)
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
 //!   Esc            leave search · discard inline edit (asks if unsaved) · quit prompt
 //!   Ctrl-S         save the inline edit (write file + reindex)
@@ -52,11 +53,13 @@ use ratatui::{
 use tui_textarea::{Input, TextArea};
 
 /// Pending confirmation for a destructive action, so we never silently lose
-/// unsaved edits: quitting while dirty, or discarding an inline edit while dirty.
+/// work: quitting while dirty, discarding an inline edit while dirty, or
+/// deleting the open/selected note.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     Quit,
     CancelEdit,
+    Delete,
 }
 
 struct App {
@@ -236,6 +239,57 @@ impl App {
         }
     }
 
+    /// Arm a deletion confirmation for the selected note. Deletion is destructive
+    /// (removes the file from disk), so it always requires an explicit Enter.
+    fn arm_delete(&mut self) {
+        let idx = match self.list_state.selected() {
+            Some(i) => i,
+            None => {
+                self.status = "select a note first, then press d to delete".into();
+                return;
+            }
+        };
+        if self.notes.get(idx).is_none() {
+            self.status = "select a note first, then press d to delete".into();
+            return;
+        }
+        self.confirm_pending = Some(Confirm::Delete);
+        self.status = "delete this note? Enter to delete, any other key cancels".into();
+    }
+
+    /// Actually delete the previously selected note and refresh the list.
+    fn delete_selected(&mut self) {
+        let idx = match self.list_state.selected() {
+            Some(i) => i,
+            None => return,
+        };
+        let note = match self.notes.get(idx) {
+            Some(n) => n.clone(),
+            None => return,
+        };
+        match qmd::delete_note(&note.file) {
+            Ok(()) => {
+                // If the deleted note was open, close the pane.
+                if self.open_file.as_deref() == Some(&note.file) {
+                    self.open_file = None;
+                    self.open_body.clear();
+                    self.open_abs = None;
+                    self.dirty = false;
+                    self.edit_mode = false;
+                }
+                self.status = format!("deleted {}", note.file);
+                self.reload_notes();
+                // Keep a valid selection after the list shrinks.
+                if !self.notes.is_empty() {
+                    let max = self.notes.len() - 1;
+                    let sel = self.list_state.selected().unwrap_or(0).min(max);
+                    self.list_state.select(Some(sel));
+                }
+            }
+            Err(e) => self.status = format!("delete error: {e}"),
+        }
+    }
+
     /// Load the open note into the inline editor.
     fn start_edit(&mut self) {
         if self.open_file.is_none() {
@@ -393,6 +447,7 @@ impl App {
                             self.edit_mode = false;
                             self.status = "edit discarded".into();
                         }
+                        Confirm::Delete => self.delete_selected(),
                     }
                 }
                 _ => {
@@ -502,6 +557,7 @@ impl App {
             KeyCode::Char('/') => self.searching = true,
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('c') => self.start_pick_collection(),
+            KeyCode::Char('d') => self.arm_delete(),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('n') => self.start_create(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => self.save_edit(),
@@ -714,6 +770,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("c", "switch collection (filter list + search)"),
     ("n", "create a new note"),
     ("e", "edit the open note inline"),
+    ("d", "delete the selected note (asks)"),
     ("Ctrl-S", "save the inline edit (write + reindex)"),
     ("PgUp/PgDn", "scroll the note body"),
     ("Home/End", "jump to top / bottom of body"),
@@ -857,7 +914,7 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             None => Text::from(
                 "Select a note on the left, then press Enter to open it.\n\n\
                  Keys: / search · ↑↓ move · Enter open · n new note · e edit inline\n\
-                 c switch collection · Ctrl-S save · ? help · q quit\n\
+                 c switch collection · d delete · Ctrl-S save · ? help · q quit\n\
                  Unsaved edits: q asks, Esc in editor asks, Enter confirms discard/quit\n\
                  Scroll: mouse wheel · PgUp/PgDn · Home/End",
             ),
@@ -917,10 +974,7 @@ mod app_tests {
     // usable indexed collection (QMD_TUI_TEST_COLL_DIR + working qmd index).
     #[test]
     fn create_then_save_roundtrip() {
-        let dir = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let name = format!("qmd-tui-it-{}.md", std::process::id());
         let mut app = App::new();
         // Force the create prompt to target our test collection.
@@ -1254,6 +1308,95 @@ mod app_tests {
         app.handle_key(key('n'));
         assert!(!app.show_help, "help closed on keypress");
         assert!(!app.creating, "create prompt not triggered while help was open");
+    }
+
+    // 'd' arms a mandatory delete confirmation; only Enter deletes, and any
+    // other key cancels without touching the file. Uses a real index.
+    #[test]
+    fn delete_requires_confirm_and_cancels() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let name = format!("qmd-tui-del-{}.md", std::process::id());
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        // Type content + save so the note is actually indexed and listed.
+        for c in "deletable content".chars() {
+            app.handle_key(key(c));
+        }
+        app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!app.edit_mode, "save exits edit mode");
+        let present = app.notes.iter().any(|n| n.file.ends_with(&name));
+        assert!(present, "saved note should be listed");
+
+        // 'd' arms the prompt (no deletion yet).
+        app.handle_key(key('d'));
+        assert!(app.confirm_pending.is_some(), "delete prompt armed");
+        let still_there = app.notes.iter().any(|n| n.file.ends_with(&name));
+        assert!(still_there, "file not deleted until confirmed");
+
+        // A non-Enter key cancels the prompt (no delete).
+        app.handle_key(key('x'));
+        assert!(app.confirm_pending.is_none(), "prompt cancelled on non-Enter");
+        let still_there2 = app.notes.iter().any(|n| n.file.ends_with(&name));
+        assert!(still_there2, "file still present after cancel");
+
+        // Clean up the created file (the delete was cancelled) so the index
+        // stays consistent.
+        let _ = qmd::delete_note(app.open_file.as_deref().unwrap_or(""));
+    }
+
+    // Enter on the delete prompt deletes the note and refreshes the list.
+    #[test]
+    fn delete_confirm_removes_note() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let name = format!("qmd-tui-del2-{}.md", std::process::id());
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        for c in "deletable content two".chars() {
+            app.handle_key(key(c));
+        }
+        app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!app.edit_mode, "save exits edit mode");
+        let present = app.notes.iter().any(|n| n.file.ends_with(&name));
+        assert!(present, "saved note should be listed");
+
+        app.handle_key(key('d'));
+        assert!(app.confirm_pending.is_some(), "delete prompt armed");
+        app.handle_key(key_enter());
+        assert!(app.confirm_pending.is_none(), "prompt cleared after confirm");
+
+        let gone = app.notes.iter().any(|n| n.file.ends_with(&name));
+        assert!(!gone, "note removed from list after delete");
+
+        // Make sure it is also gone from the index (re-check via qmd).
+        let listed = match qmd::list_notes(None) {
+            Ok(v) => v.iter().any(|n| n.file.ends_with(&name)),
+            Err(_) => false,
+        };
+        assert!(!listed, "note removed from the qmd index");
     }
 }
 
