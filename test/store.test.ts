@@ -3520,6 +3520,61 @@ describe("Vector Table", () => {
       await cleanupTestDb(store);
     }
   });
+
+  test("targeted reindex indexes a new file and applies mtime-skip to unchanged ones", async () => {
+    const store = await createTestStore();
+    const collectionName = "targeted-new";
+    const collectionPath = join(testDir, `targeted-new-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "a.md"), "# A\n\nalpha\n");
+    await writeFile(join(collectionPath, "b.md"), "# B\n\nbeta\n");
+
+    try {
+      const full = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+      expect(full.indexed).toBe(2);
+
+      // Add a brand-new file; reindex only the new file via --path.
+      await new Promise(r => setTimeout(r, 1100));
+      await writeFile(join(collectionPath, "c.md"), "# C\n\ngamma fresh\n");
+      const addOnly = await reindexCollection(store, collectionPath, "**/*.md", collectionName, {
+        paths: [join(collectionPath, "c.md")],
+      });
+      expect(addOnly.indexed).toBe(1);
+      expect(addOnly.updated).toBe(0);
+
+      // Re-running the same targeted path must be a no-op (mtime matches),
+      // proving the unchanged branch fires inside targeted mode too.
+      const again = await reindexCollection(store, collectionPath, "**/*.md", collectionName, {
+        paths: [join(collectionPath, "c.md")],
+      });
+      expect(again.unchanged).toBe(1);
+      expect(again.indexed).toBe(0);
+      expect(again.updated).toBe(0);
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("targeted reindex skips a nonexistent path without throwing", async () => {
+    const store = await createTestStore();
+    const collectionName = "targeted-missing";
+    const collectionPath = join(testDir, `targeted-missing-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "a.md"), "# A\n\nalpha\n");
+
+    try {
+      const result = await reindexCollection(store, collectionPath, "**/*.md", collectionName, {
+        paths: [join(collectionPath, "a.md"), join(collectionPath, "does-not-exist.md")],
+      });
+      // The present file is indexed; the missing one is reported, not fatal.
+      expect(result.indexed + result.updated + result.unchanged).toBeGreaterThanOrEqual(1);
+      expect(result.skippedFiles.some(s => /ENOENT|no such file/i.test(s.code))).toBe(true);
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 // =============================================================================
