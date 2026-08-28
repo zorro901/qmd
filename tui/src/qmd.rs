@@ -13,7 +13,6 @@ pub struct Note {
     pub file: String,     // "collection/path.md"
     pub title: String,
     pub mtime: String,
-    pub abs_path: Option<PathBuf>, // resolved from --full-path when available
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,8 +25,6 @@ struct NotesJson {
 
 #[derive(Debug, Clone, Deserialize)]
 struct MultiGetJson {
-    #[serde(default)]
-    title: String,
     #[serde(default)]
     body: String,
     #[serde(default, rename = "fsPath")]
@@ -77,7 +74,6 @@ pub fn list_notes(collection: Option<&str>) -> Result<Vec<Note>, String> {
             file: n.file,
             title: n.title,
             mtime: n.mtime,
-            abs_path: None,
         })
         .collect())
 }
@@ -103,7 +99,6 @@ pub fn search(query: &str, collection: Option<&str>) -> Result<Vec<Note>, String
             file: n.file,
             title: n.title,
             mtime: n.mtime,
-            abs_path: None,
         })
         .collect())
 }
@@ -233,6 +228,23 @@ mod tests {
         // Reindex the (now-removed) file so the index stays consistent.
         let _ = save(&abs, "");
         assert!(listed, "newly created note should appear in qmd notes");
+    }
+
+    // NotesJson parses the mtime field, which the TUI renders as a recency
+    // suffix in the list (serde defaults it to "" when absent).
+    #[test]
+    fn notes_json_parses_mtime() {
+        let raw = r#"[{"file":"t/foo.md","title":"Foo","mtime":"2026-08-28T15:00:00Z"}]"#;
+        let parsed: Vec<NotesJson> = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].mtime, "2026-08-28T15:00:00Z");
+        assert_eq!(parsed[0].title, "Foo");
+        assert_eq!(parsed[0].file, "t/foo.md");
+
+        // mtime defaults to "" when the field is missing (title is still required).
+        let raw = r#"[{"file":"t/bar.md","title":"Bar"}]"#;
+        let parsed: Vec<NotesJson> = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed[0].mtime, "", "mtime defaults to empty string");
     }
 }
 

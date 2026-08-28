@@ -722,6 +722,14 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             for s in highlight(&n.file, &app.query) {
                 spans.push(s.fg(Color::DarkGray));
             }
+            // Dim recency suffix from the ISO mtime (YYYY-MM-DD prefix).
+            let date = n.mtime.get(..10).unwrap_or("");
+            if !date.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {date}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             if is_open {
                 spans.push(Span::styled(
                     "  ◀ open",
@@ -768,7 +776,7 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         // Inline editor: render the textarea with the same border/title.
         let mut ta = app.textarea.clone();
         ta.set_block(block);
-        f.render_widget(ta.widget(), area);
+        f.render_widget(&ta, area);
     } else {
         let text = match &app.open_file {
             Some(_) => Text::from(app.open_body.clone()),
