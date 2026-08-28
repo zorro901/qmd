@@ -13,6 +13,7 @@
 //!   ↑ ↓            move through the note list
 //!   Enter          open the selected note in the right pane
 //!   c              switch collection (filter the list/notes)
+//!   ?              show keybindings
 //!   n              create a new note (enter "<collection>/<file>.md")
 //!   e              edit the open note inline (tui-textarea)
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
@@ -87,6 +88,8 @@ struct App {
     collection_idx: usize,
     /// When true, a collection-switcher picker overlay is active.
     picking: bool,
+    /// When true, the keybinding help overlay is shown (dismissed by any key).
+    show_help: bool,
 }
 
 impl App {
@@ -112,6 +115,7 @@ impl App {
             collections: Vec::new(),
             collection_idx: 0,
             picking: false,
+            show_help: false,
         };
         app.reload_notes();
         app
@@ -399,6 +403,12 @@ impl App {
             return false;
         }
 
+        // Help overlay is modal: any key dismisses it (re-pressing ? also works).
+        if self.show_help {
+            self.show_help = false;
+            return false;
+        }
+
         // Inline-edit mode captures keys for tui-textarea.
         if self.edit_mode {
             match key.code {
@@ -490,6 +500,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('/') => self.searching = true,
+            KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('c') => self.start_pick_collection(),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('n') => self.start_create(),
@@ -598,6 +609,9 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
     if app.picking {
         render_collection_picker(f, app);
     }
+    if app.show_help {
+        render_help(f);
+    }
 }
 
 /// Render a centered collections-switcher overlay. Index 0 is the synthetic
@@ -649,6 +663,66 @@ fn render_collection_picker(f: &mut Frame<'_>, app: &mut App) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, popup, &mut state);
 }
+
+/// Render a centered keybinding help overlay. Any key dismisses it (handled in
+/// `App::handle_key`).
+fn render_help(f: &mut Frame<'_>) {
+    use ratatui::widgets::Clear;
+    let area = f.area();
+    let width = 54.min(area.width.saturating_sub(4));
+    let lines = HELP_LINES.len() as u16;
+    let height = (lines + 2).min(area.height.saturating_sub(4));
+    let x = area.width.saturating_sub(width) / 2;
+    let y = area.height.saturating_sub(height) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+
+    let body: Vec<Line> = HELP_LINES
+        .iter()
+        .map(|(key, desc)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("  {:<16}", key),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(*desc),
+            ])
+        })
+        .collect();
+
+    let para = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("qmd-tui keys  —  press any key to close"),
+        );
+    f.render_widget(para, popup);
+}
+
+/// (key, description) pairs shown in the help overlay. Kept as data so the
+/// empty-state hint text can reuse the same source of truth.
+const HELP_LINES: &[(&str, &str)] = &[
+    ("/", "focus the search box (live, as you type)"),
+    ("Ctrl-F", "focus the search box"),
+    ("Enter", "open the selected note"),
+    ("↑ / ↓", "move through the note list"),
+    ("c", "switch collection (filter list + search)"),
+    ("n", "create a new note"),
+    ("e", "edit the open note inline"),
+    ("Ctrl-S", "save the inline edit (write + reindex)"),
+    ("PgUp/PgDn", "scroll the note body"),
+    ("Home/End", "jump to top / bottom of body"),
+    ("mouse wheel", "scroll the note body"),
+    ("?", "show this help"),
+    ("Ctrl-R", "reload the note list"),
+    ("q", "quit (asks if there are unsaved changes)"),
+    ("Esc", "cancel search / discard edit (asks) / close"),
+];
 
 fn self_collection_active(app: &App, name: &str) -> bool {
     app.collection.as_deref() == Some(name)
@@ -782,7 +856,8 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Some(_) => Text::from(app.open_body.clone()),
             None => Text::from(
                 "Select a note on the left, then press Enter to open it.\n\n\
-                 Keys: / search · ↑↓ move · Enter open · n new note · e edit inline · Ctrl-S save · q quit\n\
+                 Keys: / search · ↑↓ move · Enter open · n new note · e edit inline\n\
+                 c switch collection · Ctrl-S save · ? help · q quit\n\
                  Unsaved edits: q asks, Esc in editor asks, Enter confirms discard/quit\n\
                  Scroll: mouse wheel · PgUp/PgDn · Home/End",
             ),
@@ -1150,6 +1225,35 @@ mod app_tests {
         app.handle_key(key_esc());
         assert!(!app.picking, "esc closes the picker");
         assert_eq!(app.collection.as_deref(), Some("work"), "active collection unchanged on cancel");
+    }
+
+    // '?' opens the help overlay and any key dismisses it.
+    #[test]
+    fn help_overlay_toggles() {
+        let mut app = App::new();
+        assert!(!app.show_help, "help starts hidden");
+        app.handle_key(key('?'));
+        assert!(app.show_help, "'?' opens the help overlay");
+        // Any key (including another '?') dismisses it without side effects.
+        app.handle_key(key('x'));
+        assert!(!app.show_help, "any key closes the help overlay");
+        // Re-open and dismiss with '?' itself.
+        app.handle_key(key('?'));
+        assert!(app.show_help);
+        app.handle_key(key('?'));
+        assert!(!app.show_help, "'?' also toggles help off");
+    }
+
+    // Help is modal: while open, normal keys (e.g. 'n', Enter) do not trigger
+    // their usual action — they just close the overlay.
+    #[test]
+    fn help_overlay_is_modal() {
+        let mut app = App::new();
+        app.handle_key(key('?'));
+        assert!(app.show_help);
+        app.handle_key(key('n'));
+        assert!(!app.show_help, "help closed on keypress");
+        assert!(!app.creating, "create prompt not triggered while help was open");
     }
 }
 
