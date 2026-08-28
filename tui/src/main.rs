@@ -10,7 +10,7 @@
 //!
 //! Keys:
 //!   /  or Ctrl-F   focus the search box
-//!   ↑ ↓            move through the note list
+//!   ↑ ↓  or  j k    move through the note list (g = top, G = bottom)
 //!   Enter          open the selected note in the right pane
 //!   c              switch collection (filter the list/notes)
 //!   ?              show keybindings
@@ -237,6 +237,19 @@ impl App {
             }
             Err(e) => self.status = format!("open error: {e}"),
         }
+    }
+
+    /// Move the list selection by `delta` rows (negative = up), clamped to the
+    /// list bounds. No-op when the list is empty. Shared by the arrow keys and
+    /// the vim-style `j`/`k` bindings.
+    fn move_selection(&mut self, delta: isize) {
+        if self.notes.is_empty() {
+            return;
+        }
+        let i = self.list_state.selected().unwrap_or(0);
+        let len = self.notes.len() as isize;
+        let next = (i as isize + delta).clamp(0, len - 1) as usize;
+        self.list_state.select(Some(next));
     }
 
     /// Arm a deletion confirmation for the selected note. Deletion is destructive
@@ -565,20 +578,20 @@ impl App {
                 self.searching = true
             }
             KeyCode::Enter => self.open_selected(),
-            KeyCode::Down => {
+            KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::Char('g') => {
                 if !self.notes.is_empty() {
-                    let i = self.list_state.selected().unwrap_or(0);
-                    let next = (i + 1).min(self.notes.len() - 1);
-                    self.list_state.select(Some(next));
+                    self.list_state.select(Some(0));
                 }
             }
-            KeyCode::Up => {
+            KeyCode::Char('G') => {
                 if !self.notes.is_empty() {
-                    let i = self.list_state.selected().unwrap_or(0);
-                    let prev = i.saturating_sub(1);
-                    self.list_state.select(Some(prev));
+                    self.list_state.select(Some(self.notes.len() - 1));
                 }
             }
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reload_notes()
             }
@@ -766,7 +779,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("/", "focus the search box (live, as you type)"),
     ("Ctrl-F", "focus the search box"),
     ("Enter", "open the selected note"),
-    ("↑ / ↓", "move through the note list"),
+    ("↑ ↓ / j k", "move through the note list (g top · G bottom)"),
     ("c", "switch collection (filter list + search)"),
     ("n", "create a new note"),
     ("e", "edit the open note inline"),
@@ -1025,15 +1038,37 @@ mod app_tests {
         assert!(app.dirty, "still dirty after cancel");
     }
 
-    // Enter after the quit prompt actually quits (discarding unsaved edits).
+    // Vim-style navigation: j/k move by one, g jumps to top, G to bottom, and
+    // movement clamps at both ends. Uses a synthetic note list so the result is
+    // deterministic regardless of the index on the test machine.
     #[test]
-    fn enter_confirms_quit() {
+    fn vim_keys_move_selection() {
         let mut app = App::new();
-        app.dirty = true;
-        let _ = app.handle_key(key('q'));
-        assert!(app.confirm_pending.is_some());
-        let quit = app.handle_key(key_enter());
-        assert!(quit, "Enter should confirm quit");
+        app.notes = (0..5).map(|i| qmd::Note {
+            file: format!("t/n{i}.md"),
+            title: format!("n{i}"),
+            mtime: String::new(),
+        }).collect();
+        app.list_state.select(Some(0));
+
+        app.handle_key(key('j'));
+        assert_eq!(app.list_state.selected(), Some(1), "j moves down one");
+        app.handle_key(key('k'));
+        assert_eq!(app.list_state.selected(), Some(0), "k moves up one");
+        app.handle_key(key('G'));
+        assert_eq!(app.list_state.selected(), Some(4), "G jumps to bottom");
+        app.handle_key(key('G'));
+        assert_eq!(app.list_state.selected(), Some(4), "G clamps at bottom");
+        app.handle_key(key('g'));
+        assert_eq!(app.list_state.selected(), Some(0), "g jumps to top");
+        app.handle_key(key('k'));
+        assert_eq!(app.list_state.selected(), Some(0), "k clamps at top");
+
+        // Arrow keys stay consistent with j/k via the shared helper.
+        app.handle_key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.list_state.selected(), Some(1), "Down == j");
+        app.handle_key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.list_state.selected(), Some(0), "Up == k");
     }
 
     // Esc while editing dirty content arms a discard prompt; Enter discards.

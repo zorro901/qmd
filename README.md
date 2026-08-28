@@ -87,11 +87,12 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | Key | Action |
 |-----|--------|
 | `/` or `Ctrl-F` | Focus search (filters live as you type) |
-| `↑` / `↓` | Move through the note list |
+| `↑` / `↓` or `j` / `k` | Move through the note list (`g` top, `G` bottom) |
 | `Enter` | Open the selected note in the right pane |
 | `c` | Switch collection (filters the list and search) |
 | `n` | Create a new note |
 | `e` | Edit the open note inline (tui-textarea) |
+| `d` | Delete the selected note (asks to confirm) |
 | `Ctrl-S` | Save the inline edit (write file + reindex) |
 | `PgUp` / `PgDn`, `Home` / `End`, mouse wheel | Scroll the note body |
 | `Ctrl-R` | Reload the note list |
