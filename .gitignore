@@ -20,3 +20,4 @@ finetune/data/train/
 .claude/
 tui/target/
 bin/qmd-tui
+bin/qmd-tui.tmp

@@ -85,11 +85,15 @@ if (cargo.status === 0) {
   const stagedBin = join(root, "bin", "qmd-tui");
   try {
     const data = readFileSync(releaseBin);
-    writeFileSync(stagedBin, data);
-    chmodSync(stagedBin, 0o755);
+    // Stage via a temp file + atomic rename so we can overwrite bin/qmd-tui
+    // even while it is currently executing (ETXTBSY on some platforms).
+    const tmp = `${stagedBin}.tmp`;
+    writeFileSync(tmp, data);
+    chmodSync(tmp, 0o755);
+    renameSync(tmp, stagedBin);
     console.log(`staged qmd-tui -> ${stagedBin}`);
-  } catch {
-    console.warn("qmd-tui release binary not found; skipping staging.");
+  } catch (e) {
+    console.warn(`qmd-tui staging skipped: ${e.message}`);
   }
 } else {
   console.log("cargo not found — skipping qmd-tui build (install Rust to enable `qmd tui`).");
