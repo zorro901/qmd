@@ -88,7 +88,7 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 |-----|--------|
 | `/` or `Ctrl-F` | Focus search (filters live as you type) |
 | `↑` / `↓` or `j` / `k` | Move through the note list; the body previews as you go (`g` top, `G` bottom) |
-| `Enter` | Open the selected note in the right pane |
+| `Enter` | Preview the selected note (hover already previews as you move) |
 | `c` | Switch collection (filters the list and search) |
 | `n` | Create a new note |
 | `r` | Rename / move the selected note (cross-collection) |

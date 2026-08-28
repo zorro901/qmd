@@ -267,25 +267,11 @@ impl App {
     }
 
     fn open_selected(&mut self) {
-        let idx = match self.list_state.selected() {
-            Some(i) => i,
-            None => return,
-        };
-        let note = match self.notes.get(idx) {
-            Some(n) => n.clone(),
-            None => return,
-        };
-        match qmd::get_body(&note.file) {
-            Ok((body, abs)) => {
-                self.open_file = Some(note.file.clone());
-                self.open_body = body;
-                self.open_abs = abs;
-                self.dirty = false;
-                self.vertical_scroll = 0;
-                self.status = format!("opened {}", note.file);
-            }
-            Err(e) => self.status = format!("open error: {e}"),
-        }
+        // Preview-on-hover (t12) already loads the selected note into the right
+        // pane as the cursor moves, so Enter is kept only as an explicit,
+        // discoverable equivalent. It delegates to preview_selected so the body
+        // always reflects the current selection and never diverges from hover.
+        self.preview_selected();
     }
 
     /// Load the currently-selected note into the right pane (preview), unless it
@@ -976,7 +962,7 @@ fn render_help(f: &mut Frame<'_>) {
 const HELP_LINES: &[(&str, &str)] = &[
     ("/", "focus the search box (live, as you type)"),
     ("Ctrl-F", "focus the search box"),
-    ("Enter", "open the selected note"),
+    ("Enter", "preview the selected note (hover already previews as you move)"),
     ("↑ ↓ / j k", "move through the note list; the body previews as you go (g top · G bottom)"),
     ("c", "switch collection (filter list + search)"),
     ("n", "create a new note"),
@@ -1396,6 +1382,22 @@ mod app_tests {
 
         let sel = app.list_state.selected().expect("a row stays selected");
         assert_eq!(app.notes[sel].file, want_id, "same note selected after reload");
+    }
+
+    // Enter must behave identically to hover-preview: the body reflects the
+    // current selection and never diverges. Skips without a usable collection.
+    #[test]
+    fn enter_preview_matches_selection() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        if app.notes.len() < 2 {
+            return;
+        }
+        // Move the cursor, then press Enter.
+        app.list_state.select(Some(1));
+        app.handle_key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        let sel_id = app.notes[1].file.clone();
+        assert_eq!(app.open_file.as_deref(), Some(sel_id.as_str()));
     }
 
     // Quit with unsaved edits must NOT exit (handle_key returns false); a second
