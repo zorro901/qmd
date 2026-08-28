@@ -11,7 +11,7 @@
 //! Keys:
 //!   /  or Ctrl-F   focus the search box
 //!   ↑ ↓  or  j k    move through the note list; the body previews as you go (g = top, G = bottom)
-//!   Enter          open the selected note in the right pane
+//!   Enter          preview the selected note (hover already previews as you move)
 //!   c              switch collection (filter the list/notes)
 //!   ?              show keybindings
 //!   n              create a new note (enter "<collection>/<file>.md")
