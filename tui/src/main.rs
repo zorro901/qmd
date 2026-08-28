@@ -246,6 +246,12 @@ impl App {
                 // Refresh the list so a freshly created/edited note shows up
                 // (and the title reflects the new file) without a manual reload.
                 self.reload_notes();
+                // Keep the just-saved note selected in the list.
+                if let Some(open) = &self.open_file {
+                    if let Some(idx) = self.notes.iter().position(|n| &n.file == open) {
+                        self.list_state.select(Some(idx));
+                    }
+                }
             }
             Err(e) => self.status = format!("save error: {e}"),
         }
@@ -460,11 +466,19 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .map(|n| {
             let title = if n.title.is_empty() { &n.file } else { &n.title };
-            ListItem::new(Line::from(vec![
+            let is_open = matches!(&app.open_file, Some(f) if f == &n.file);
+            let mut spans = vec![
                 Span::styled(title.to_string(), Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
                 Span::styled(&n.file, Style::default().fg(Color::DarkGray)),
-            ]))
+            ];
+            if is_open {
+                spans.push(Span::styled(
+                    "  ◀ open",
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -657,12 +671,19 @@ mod app_tests {
             content.contains("hello via keys"),
             "typed text should be saved; got: {content:?}"
         );
-        // Save refreshes the list, so the freshly created note should be listed.
+        // Save refreshes the list, so the freshly created note should be listed
+        // and re-selected.
         let listed = app
             .notes
             .iter()
             .any(|n| n.file.ends_with(&name));
         assert!(listed, "new note should appear in the list after save");
+        let sel = app.list_state.selected();
+        let selected_is_open = sel
+            .and_then(|i| app.notes.get(i))
+            .map(|n| n.file.ends_with(&name))
+            .unwrap_or(false);
+        assert!(selected_is_open, "saved note should be re-selected in the list");
         // Clean up.
         let _ = std::fs::remove_file(&abs);
         let _ = qmd::save(&abs, "");
