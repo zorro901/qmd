@@ -4,6 +4,7 @@
 //! the file ourselves. This keeps qmd the single source of truth.
 
 use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
 
 use serde::Deserialize;
@@ -205,6 +206,58 @@ pub fn rename_note(from: &str, to: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Duplicate a note into a new file in the same collection, returning the new
+/// note id ("collection/path.md"). The body (with no line numbers) is copied
+/// verbatim from the source, and the new file is reindexed with
+/// `qmd update --path <abs>` so it shows up immediately. The destination name
+/// is `<stem> copy.md`, or `<stem> copy N.md` when that already exists, so a
+/// duplicate never overwrites an existing note.
+pub fn duplicate_note(file: &str) -> Result<String, String> {
+    let (body, abs) = get_body(file)?;
+    let src_abs = match abs {
+        Some(p) => p,
+        None => return Err(format!("could not resolve path for {file}")),
+    };
+    let coll_dir = src_abs
+        .parent()
+        .ok_or_else(|| format!("no parent dir for {file}"))?
+        .to_path_buf();
+    let base = src_abs
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("invalid filename for {file}"))?
+        .to_string();
+    let dest = unique_copy_name(&coll_dir, &base);
+    let dest_abs = coll_dir.join(&dest);
+    std::fs::write(&dest_abs, &body).map_err(|e| format!("write failed: {e}"))?;
+    let dest_str = dest_abs.to_string_lossy();
+    run_qmd(&["update", "--path", &dest_str])?;
+    // New note id = "<collection>/<dest filename>".
+    let coll = file
+        .split('/')
+        .next()
+        .filter(|c| !c.is_empty())
+        .unwrap_or("")
+        .to_string();
+    Ok(format!("{}/{}", coll, dest))
+}
+
+/// Pick a free "<stem> copy.md" (or "<stem> copy N.md") name within `dir`.
+fn unique_copy_name(dir: &Path, base: &str) -> String {
+    let candidate = format!("{base} copy.md");
+    if !dir.join(&candidate).exists() {
+        return candidate;
+    }
+    let mut n = 2;
+    loop {
+        let cand = format!("{base} copy {n}.md");
+        if !dir.join(&cand).exists() {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
 /// Write `content` to `abs_path`, then reindex just that file via
 /// `qmd update --path <abs>` (O(changed), no full rescan).
 pub fn save(abs_path: &PathBuf, content: &str) -> Result<(), String> {
@@ -327,5 +380,32 @@ mod tests {
         let parsed: Vec<NotesJson> = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed[0].mtime, "", "mtime defaults to empty string");
     }
+
+    // unique_copy_name picks "<stem> copy.md" when free, and "<stem> copy N.md"
+    // (ascending) once collisions exist, so a duplicate never clobbers a file.
+    #[test]
+    fn unique_copy_name_avoids_collisions() {
+        let dir = std::env::temp_dir().join(format!("qmd-tui-copytest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert_eq!(
+            unique_copy_name(&dir, "note"),
+            "note copy.md",
+            "free name needs no suffix"
+        );
+        let _ = std::fs::write(dir.join("note copy.md"), "");
+        assert_eq!(
+            unique_copy_name(&dir, "note"),
+            "note copy 2.md",
+            "first collision gets ' 2'"
+        );
+        let _ = std::fs::write(dir.join("note copy 2.md"), "");
+        assert_eq!(
+            unique_copy_name(&dir, "note"),
+            "note copy 3.md",
+            "second collision gets ' 3'"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
 

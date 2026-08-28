@@ -92,6 +92,7 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | `c` | Switch collection (filters the list and search) |
 | `n` | Create a new note |
 | `r` | Rename / move the selected note (cross-collection) |
+| `y` | Duplicate the selected note into a copy (same collection) |
 | `e` | Edit the open note inline (tui-textarea) |
 | `d` | Delete the selected note (asks to confirm) |
 | `Ctrl-S` | Save the inline edit (write file + reindex) |

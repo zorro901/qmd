@@ -16,6 +16,7 @@
 //!   ?              show keybindings
 //!   n              create a new note (enter "<collection>/<file>.md")
 //!   r              rename / move the selected note ("<collection>/<file>.md")
+//!   y              duplicate the selected note into a copy (same collection)
 //!   e              edit the open note inline (tui-textarea)
 //!   d              delete the selected note (asks to confirm)
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
@@ -333,6 +334,38 @@ impl App {
         }
         self.confirm_pending = Some(Confirm::Delete);
         self.status = "delete this note? Enter to delete, any other key cancels".into();
+    }
+
+    /// Duplicate the selected note into a new file in the same collection. This
+    /// is non-destructive (creates a copy), so it does not need a confirm guard.
+    /// After duplicating, the list is refreshed and the copy is selected + opened.
+    fn duplicate_selected(&mut self) {
+        let idx = match self.list_state.selected() {
+            Some(i) => i,
+            None => {
+                self.status = "select a note first, then press y to duplicate".into();
+                return;
+            }
+        };
+        let note = match self.notes.get(idx) {
+            Some(n) => n.clone(),
+            None => {
+                self.status = "select a note first, then press y to duplicate".into();
+                return;
+            }
+        };
+        match qmd::duplicate_note(&note.file) {
+            Ok(new_id) => {
+                self.reload_notes();
+                self.status = format!("duplicated to {new_id}");
+                // Select and preview the freshly created copy.
+                if let Some(pos) = self.notes.iter().position(|n| n.file == new_id) {
+                    self.list_state.select(Some(pos));
+                    self.preview_selected();
+                }
+            }
+            Err(e) => self.status = format!("duplicate error: {e}"),
+        }
     }
 
     /// Actually delete the previously selected note and refresh the list.
@@ -717,6 +750,7 @@ impl App {
             KeyCode::Char('?') => self.show_help = true,
             KeyCode::Char('c') => self.start_pick_collection(),
             KeyCode::Char('d') => self.arm_delete(),
+            KeyCode::Char('y') => self.duplicate_selected(),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('n') => self.start_create(),
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => self.start_rename(),
@@ -932,6 +966,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("c", "switch collection (filter list + search)"),
     ("n", "create a new note"),
     ("r", "rename / move the selected note (cross-collection)"),
+    ("y", "duplicate the selected note into a copy (same collection)"),
     ("e", "edit the open note inline"),
     ("d", "delete the selected note (asks)"),
     ("Ctrl-S", "save the inline edit (write + reindex)"),
@@ -1253,6 +1288,68 @@ mod app_tests {
 
         // Clean up the moved file.
         let _ = qmd::delete_note(&new_id);
+    }
+
+    // Duplicate flow (y): create a note, select it, press y, and verify a copy
+    // appears in the index with the same content and a unique "<name> copy.md"
+    // id. Skips without a usable indexed collection.
+    #[test]
+    fn duplicate_creates_copy_in_index() {
+        let dir: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
+            Ok(d) => d.into(),
+            Err(_) => return,
+        };
+        let colls = match qmd::list_collections() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let coll = match colls.iter().find(|(_, p)| p == &dir).map(|(n, _)| n.clone()) {
+            Some(n) => n,
+            None => return,
+        };
+        let base = format!("qmd-tui-dup-{}.md", std::process::id());
+        let old_id = format!("{}/{}", coll, base);
+        let abs = match qmd::create_note(&dir, &base, "# duplicate me\nbody line\n") {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+
+        let mut app = App::new();
+        // Create a second note too, so a unique copy name is deterministic.
+        let _ = qmd::create_note(&dir, &format!("qmd-tui-dup2-{}.md", std::process::id()), "# other\n");
+
+        let idx = match app.notes.iter().position(|n| n.file == old_id) {
+            Some(i) => i,
+            None => {
+                let _ = std::fs::remove_file(&abs);
+                let _ = qmd::save(&abs, "");
+                return;
+            }
+        };
+        app.list_state.select(Some(idx));
+
+        app.handle_key(key('y'));
+
+        let listed = qmd::list_notes(Some(&coll)).unwrap_or_default();
+        let copy_stem = base.trim_end_matches(".md");
+        let copy_id = format!("{}/{copy_stem} copy.md", coll);
+        let copy_body = match qmd::get_body(&copy_id) {
+            Ok((b, _)) => b,
+            Err(_) => {
+                let _ = qmd::delete_note(&old_id);
+                panic!("expected copy {copy_id} to exist in the index");
+            }
+        };
+        assert!(
+            copy_body.contains("body line"),
+            "copy should contain the source body"
+        );
+        assert!(listed.iter().any(|n| n.file == old_id), "original still present");
+        assert!(listed.iter().any(|n| n.file == copy_id), "copy present in index");
+
+        // Clean up both files.
+        let _ = qmd::delete_note(&copy_id);
+        let _ = qmd::delete_note(&old_id);
     }
 
     // Quit with unsaved edits must NOT exit (handle_key returns false); a second
