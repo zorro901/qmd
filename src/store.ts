@@ -1552,8 +1552,8 @@ export type Store = {
   // Document indexing operations
   insertContent: (hash: string, content: string, createdAt: string) => void;
   insertDocument: (collectionName: string, path: string, title: string, hash: string, createdAt: string, modifiedAt: string) => void;
-  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
-  findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string } | null;
+  findActiveDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; modifiedAt: string } | null;
+  findOrMigrateLegacyDocument: (collectionName: string, path: string) => { id: number; hash: string; title: string; modifiedAt: string } | null;
   updateDocumentTitle: (documentId: number, title: string, modifiedAt: string) => void;
   updateDocument: (documentId: number, title: string, hash: string, modifiedAt: string) => void;
   deactivateDocument: (collectionName: string, path: string) => void;
@@ -1658,6 +1658,38 @@ export async function reindexCollection(
     }
     seenPaths.add(path);
 
+    // Fast path: stat the file first and compare its mtime against the mtime
+    // we recorded when the document was last indexed. If they match, the file
+    // has not changed — skip the read + SHA256 entirely. This turns `qmd
+    // update` from O(all files read+hashed) into O(changed files), so a single
+    // add/edit on a 100k-file collection no longer rescans every file (#perf).
+    // mtime is compared in whole seconds because some filesystems (and some
+    // Node/Bun stat implementations) truncate mtime to 1s resolution, which
+    // would otherwise cause spurious misses and force a re-hash.
+    let stat: ReturnType<typeof statSync> | undefined;
+    try {
+      stat = statSync(filepath);
+    } catch (err) {
+      // Skip files that can't be stat'd instead of aborting the rest of the
+      // collection (#460).
+      processed++;
+      skippedFiles.push({ file: relativeFile, code: fsErrorCode(err) });
+      options?.onProgress?.({ file: relativeFile, current: processed, total });
+      continue;
+    }
+    const fileMtimeSec = Math.floor(Number(stat.mtimeMs) / 1000);
+
+    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
+    if (existing && fileMtimeSec > 0) {
+      const dbMtimeSec = Math.floor(Date.parse(existing.modifiedAt) / 1000);
+      if (fileMtimeSec === dbMtimeSec) {
+        unchanged++;
+        processed++;
+        options?.onProgress?.({ file: relativeFile, current: processed, total });
+        continue;
+      }
+    }
+
     let content: string;
     try {
       content = readFileSync(filepath, "utf-8");
@@ -1678,8 +1710,6 @@ export async function reindexCollection(
 
     const hash = await hashContent(content);
     const title = extractTitle(content, relativeFile);
-
-    const existing = findOrMigrateLegacyDocument(db, collectionName, path, livePaths);
 
     if (existing) {
       if (existing.hash === hash) {
@@ -2970,12 +3000,13 @@ export function findActiveDocument(
   db: Database,
   collectionName: string,
   path: string
-): { id: number; hash: string; title: string } | null {
+): { id: number; hash: string; title: string; modifiedAt: string } | null {
   const row = db.prepare(`
-    SELECT id, hash, title FROM documents
+    SELECT id, hash, title, modified_at FROM documents
     WHERE collection = ? AND path = ? AND active = 1
-  `).get(collectionName, path) as { id: number; hash: string; title: string } | undefined;
-  return row ?? null;
+  `).get(collectionName, path) as { id: number; hash: string; title: string; modified_at: string } | undefined;
+  if (!row) return null;
+  return { id: row.id, hash: row.hash, title: row.title, modifiedAt: row.modified_at };
 }
 
 /**
@@ -2997,7 +3028,7 @@ export function findOrMigrateLegacyDocument(
   collectionName: string,
   path: string,
   livePaths?: ReadonlySet<string>
-): { id: number; hash: string; title: string } | null {
+): { id: number; hash: string; title: string; modifiedAt: string } | null {
   const existing = findActiveDocument(db, collectionName, path);
   if (existing) return existing;
 
