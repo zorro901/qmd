@@ -4521,13 +4521,20 @@ if (isMain) {
     }
 
     case "tui": {
-      // Launch the Rust terminal UI (qmd-tui). Build it first with
-      // `cargo build -p qmd-tui` (or `cargo build --release` in ./tui).
-      const cargo = process.env.QMD_TUI_BIN || "qmd-tui";
-      const child = nodeSpawn(cargo, [], { stdio: "inherit", shell: false });
+      // Launch the Rust terminal UI (qmd-tui). Resolution order:
+      //   1. $QMD_TUI_BIN (explicit override)
+      //   2. bundled bin/qmd-tui (staged by `npm run build` from the crate)
+      //   3. qmd-tui on PATH
+      let bin = process.env.QMD_TUI_BIN;
+      if (!bin) {
+        const pkgRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+        const bundled = pathJoin(pkgRoot, "bin", "qmd-tui");
+        bin = existsSync(bundled) ? bundled : "qmd-tui";
+      }
+      const child = nodeSpawn(bin, [], { stdio: "inherit", shell: false });
       child.on("error", (err: NodeJS.ErrnoException) => {
-        console.error(`Failed to launch TUI (${cargo}): ${err.message}`);
-        console.error("Build it with: cd tui && cargo build --release");
+        console.error(`Failed to launch TUI (${bin}): ${err.message}`);
+        console.error("Build it with: cd tui && cargo build --release  (or install Rust and rerun npm run build)");
         process.exit(1);
       });
       break;

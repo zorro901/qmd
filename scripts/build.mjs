@@ -70,3 +70,28 @@ writeFileSync(
   join(root, "dist", "cli", "build-info.json"),
   `${JSON.stringify({ commit: buildCommit(), builtAt: new Date().toISOString() }, null, 2)}\n`,
 );
+
+// --- Rust TUI (qmd-tui) -------------------------------------------------------
+// Build the terminal UI crate and stage its release binary next to the CLI so
+// `qmd tui` can launch it without needing Rust or a PATH entry. If cargo is not
+// installed (e.g. consumers who only want the search engine), skip silently —
+// the `qmd tui` command will then fall back to a PATH lookup and print a
+// helpful message.
+const cargo = spawnSync("cargo", ["--version"], { cwd: root, stdio: "ignore" });
+if (cargo.status === 0) {
+  console.log("building qmd-tui (Rust)…");
+  run("cargo", ["build", "--release"], { cwd: join(root, "tui") });
+  const releaseBin = join(root, "tui", "target", "release", "qmd-tui");
+  const stagedBin = join(root, "bin", "qmd-tui");
+  try {
+    const data = readFileSync(releaseBin);
+    writeFileSync(stagedBin, data);
+    chmodSync(stagedBin, 0o755);
+    console.log(`staged qmd-tui -> ${stagedBin}`);
+  } catch {
+    console.warn("qmd-tui release binary not found; skipping staging.");
+  }
+} else {
+  console.log("cargo not found — skipping qmd-tui build (install Rust to enable `qmd tui`).");
+}
+

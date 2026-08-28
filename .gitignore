@@ -19,3 +19,4 @@ finetune/outputs/
 finetune/data/train/
 .claude/
 tui/target/
+bin/qmd-tui
