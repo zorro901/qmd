@@ -12,6 +12,7 @@
 //!   /  or Ctrl-F   focus the search box
 //!   ↑ ↓            move through the note list
 //!   Enter          open the selected note in the right pane
+//!   c              switch collection (filter the list/notes)
 //!   n              create a new note (enter "<collection>/<file>.md")
 //!   e              edit the open note inline (tui-textarea)
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
@@ -78,6 +79,14 @@ struct App {
     vertical_scroll: u16,
     /// Last executed search query, used to highlight matches in the list.
     query: String,
+    /// Active collection filter (None = all collections).
+    collection: Option<String>,
+    /// Available collections, loaded for the switcher picker.
+    collections: Vec<(String, std::path::PathBuf)>,
+    /// Selection index within `collections` for the switcher picker.
+    collection_idx: usize,
+    /// When true, a collection-switcher picker overlay is active.
+    picking: bool,
 }
 
 impl App {
@@ -99,20 +108,28 @@ impl App {
             confirm_pending: None,
             vertical_scroll: 0,
             query: String::new(),
+            collection: None,
+            collections: Vec::new(),
+            collection_idx: 0,
+            picking: false,
         };
         app.reload_notes();
         app
     }
 
     fn reload_notes(&mut self) {
-        match qmd::list_notes() {
+        let coll: Option<&str> = self.collection.as_deref();
+        match qmd::list_notes(coll) {
             Ok(notes) => {
                 self.notes = notes;
                 self.query = String::new();
                 if self.notes.is_empty() {
                     self.status = "no notes — run 'qmd collection add .' then 'qmd update'".into();
                 } else {
-                    self.status = format!("{} notes", self.notes.len());
+                    self.status = match &self.collection {
+                        Some(c) => format!("{} notes in {}", self.notes.len(), c),
+                        None => format!("{} notes", self.notes.len()),
+                    };
                 }
                 if self.list_state.selected().is_none() && !self.notes.is_empty() {
                     self.list_state.select(Some(0));
@@ -129,7 +146,8 @@ impl App {
             return;
         }
         self.query = q.to_lowercase();
-        match qmd::search(q) {
+        let coll: Option<&str> = self.collection.as_deref();
+        match qmd::search(q, coll) {
             Ok(notes) => {
                 self.notes = notes;
                 self.status = format!("{} results for '{}'", self.notes.len(), q);
@@ -141,6 +159,55 @@ impl App {
             }
             Err(e) => self.status = format!("search error: {e}"),
         }
+    }
+
+    /// Refresh the list of indexed collections for the switcher picker. The
+    /// picker also shows a synthetic "All collections" entry at index 0, so the
+    /// real collections are offset by one.
+    fn load_collections(&mut self) {
+        match qmd::list_collections() {
+            Ok(cols) => {
+                self.collections = cols;
+                // Point the picker selection at the active collection (if any).
+                // +1 because index 0 is the "All collections" entry.
+                self.collection_idx = self
+                    .collections
+                    .iter()
+                    .position(|(name, _)| Some(name.as_str()) == self.collection.as_deref())
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+            }
+            Err(_) => self.collections = Vec::new(),
+        }
+    }
+
+    /// Open the collection-switcher picker (loads collections first).
+    fn start_pick_collection(&mut self) {
+        self.load_collections();
+        self.picking = true;
+    }
+
+    /// Apply the picked collection (or None for "all") and reload the list.
+    /// The picker's `collection_idx` is offset by one: index 0 is the synthetic
+    /// "All collections" entry, 1..=N map to `self.collections[N-1]`.
+    fn confirm_pick_collection(&mut self) {
+        // Index 0 is the special "All collections" entry.
+        self.collection = if self.collection_idx == 0 {
+            None
+        } else {
+            self.collections
+                .get(self.collection_idx - 1)
+                .map(|(name, _)| name.clone())
+        };
+        self.picking = false;
+        // Clear search context and refresh.
+        self.search_input.clear();
+        self.query.clear();
+        self.list_state.select(None);
+        self.open_file = None;
+        self.open_body.clear();
+        self.open_abs = None;
+        self.reload_notes();
     }
 
     fn open_selected(&mut self) {
@@ -189,16 +256,22 @@ impl App {
         self.vertical_scroll = next as u16;
     }
 
-    /// Begin creating a new note: pick the first collection, then prompt for a
-    /// filename in `new_input`.
+    /// Begin creating a new note: pick a collection (the active filtered one if
+    /// set, else the first), then prompt for a filename in `new_input`.
     fn start_create(&mut self) {
         match qmd::list_collections() {
             Ok(colls) if !colls.is_empty() => {
-                // Prefill the input with the first collection name as a prefix.
-                let (name, _) = &colls[0];
-                self.new_input = format!("{name}/");
-                self.creating = true;
-                self.status = "new note — type a filename, Enter to create".into();
+                // Prefer the active collection filter, else the first one.
+                let preferred = self
+                    .collection
+                    .as_deref()
+                    .and_then(|c| colls.iter().find(|(n, _)| n == c))
+                    .or_else(|| colls.first());
+                if let Some((name, _)) = preferred {
+                    self.new_input = format!("{name}/");
+                    self.creating = true;
+                    self.status = "new note — type a filename, Enter to create".into();
+                }
             }
             Ok(_) => self.status = "no collections; run 'qmd collection add .' first".into(),
             Err(e) => self.status = format!("error: {e}"),
@@ -349,6 +422,27 @@ impl App {
             return false;
         }
 
+        // Collection-switcher picker captures keys (modal overlay).
+        if self.picking {
+            match key.code {
+                KeyCode::Enter => self.confirm_pick_collection(),
+                KeyCode::Esc => self.picking = false,
+                KeyCode::Up => {
+                    if self.collection_idx > 0 {
+                        self.collection_idx -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    let max = self.collections.len(); // +1 for "All" at index 0
+                    if self.collection_idx < max {
+                        self.collection_idx += 1;
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // Search input mode captures everything and searches live as you type.
         if self.searching {
             match key.code {
@@ -396,6 +490,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('/') => self.searching = true,
+            KeyCode::Char('c') => self.start_pick_collection(),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('n') => self.start_create(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => self.save_edit(),
@@ -499,6 +594,64 @@ fn ui(f: &mut Frame<'_>, app: &mut App) {
 
     render_list(f, app, chunks[0]);
     render_body(f, app, chunks[1]);
+
+    if app.picking {
+        render_collection_picker(f, app);
+    }
+}
+
+/// Render a centered collections-switcher overlay. Index 0 is the synthetic
+/// "All collections" entry; the rest map 1:1 to `app.collections`.
+fn render_collection_picker(f: &mut Frame<'_>, app: &mut App) {
+    use ratatui::widgets::Clear;
+    let area = f.area();
+    let width = 40.min(area.width.saturating_sub(4));
+    let height = (app.collections.len() as u16 + 3).min(area.height.saturating_sub(4));
+    let x = area.width.saturating_sub(width) / 2;
+    let y = area.height.saturating_sub(height) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+
+    let mut state = ListState::default();
+    state.select(Some(app.collection_idx));
+
+    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(Span::styled(
+        "All collections",
+        Style::default().add_modifier(Modifier::BOLD),
+    )))];
+    for (name, path) in &app.collections {
+        let active = self_collection_active(app, name);
+        let label = if active {
+            format!("● {name}  ({path:?})")
+        } else {
+            format!("  {name}  ({path:?})")
+        };
+        items.push(ListItem::new(Line::from(label)));
+    }
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("collections  —  ↑↓ move · Enter select · Esc cancel"),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(40, 44, 52))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, popup, &mut state);
+}
+
+fn self_collection_active(app: &App, name: &str) -> bool {
+    app.collection.as_deref() == Some(name)
 }
 
 /// Split `text` into spans, highlighting (yellow, bold) every case-insensitive
@@ -583,7 +736,12 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("qmd  [{}]  {}", search_line, app.status)),
+                .title(format!(
+                    "qmd  [{}]  [{}]  {}",
+                    search_line,
+                    app.collection.as_deref().unwrap_or("all"),
+                    app.status
+                )),
         )
         .highlight_style(
             Style::default()
@@ -913,6 +1071,77 @@ mod app_tests {
         assert!(!app.searching, "esc leaves search mode");
         assert_eq!(app.search_input, "", "esc clears the search box");
         assert_eq!(app.query, "", "esc clears the highlight query");
+    }
+
+    // Picker navigation clamps at the ends and the "All" entry sits at index 0.
+    #[test]
+    fn collection_picker_navigates_and_clamps() {
+        let mut app = App::new();
+        // Simulate a loaded picker with two real collections after "All".
+        app.collections = vec![
+            ("work".into(), std::path::PathBuf::from("/w")),
+            ("home".into(), std::path::PathBuf::from("/h")),
+        ];
+        app.picking = true;
+        app.collection_idx = 0;
+        // Up from the top is a no-op.
+        app.handle_key(key('k')); // not a nav key in picker -> ignored
+        // Use arrow keys via the real path.
+        app.handle_key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        assert_eq!(app.collection_idx, 0, "Up clamps at the top ('All')");
+        // Down twice reaches the last collection (index 2).
+        app.handle_key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.collection_idx, 2, "Down moves through collections");
+        // One more Down clamps at the end.
+        app.handle_key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.collection_idx, 2, "Down clamps at the last entry");
+        assert!(app.picking, "still picking until Enter/Esc");
+    }
+
+    // 'c' opens the collection picker (loads collections via qmd).
+    #[test]
+    fn collection_key_opens_picker() {
+        let mut app = App::new();
+        app.handle_key(key('c'));
+        assert!(app.picking, "'c' opens the collection picker");
+    }
+
+    // confirm_pick_collection maps a valid index (>0) to that collection, and
+    // index 0 ("All") to no filter, clearing search/list view state. Uses a
+    // manually loaded picker so it does not depend on the live qmd index.
+    #[test]
+    fn collection_switch_sets_filter() {
+        let mut app = App::new();
+        app.collections = vec![
+            ("work".into(), std::path::PathBuf::from("/w")),
+            ("home".into(), std::path::PathBuf::from("/h")),
+        ];
+        // Pick "home" (index 2: 0=All, 1=work, 2=home) and confirm.
+        app.picking = true;
+        app.collection_idx = 2;
+        app.confirm_pick_collection();
+        assert!(!app.picking, "picker closed after confirm");
+        assert_eq!(app.collection.as_deref(), Some("home"), "filter set to picked collection");
+
+        // Re-open and pick "All" (index 0).
+        app.picking = true;
+        app.collection_idx = 0;
+        app.confirm_pick_collection();
+        assert_eq!(app.collection, None, "'All' clears the filter");
+    }
+
+    // Esc cancels the picker without changing the active collection.
+    #[test]
+    fn collection_picker_esc_cancels() {
+        let mut app = App::new();
+        app.collections = vec![("work".into(), std::path::PathBuf::from("/w"))];
+        app.collection = Some("work".into());
+        app.picking = true;
+        app.collection_idx = 1; // moved selection before cancelling
+        app.handle_key(key_esc());
+        assert!(!app.picking, "esc closes the picker");
+        assert_eq!(app.collection.as_deref(), Some("work"), "active collection unchanged on cancel");
     }
 }
 

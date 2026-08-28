@@ -60,9 +60,15 @@ fn run_qmd(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// List all notes: `qmd notes --format json`.
-pub fn list_notes() -> Result<Vec<Note>, String> {
-    let raw = run_qmd(&["notes", "--format", "json"])?;
+/// List all notes: `qmd notes --format json`. When `collection` is Some, only
+/// notes from that collection are returned (`qmd notes -c <name>`).
+pub fn list_notes(collection: Option<&str>) -> Result<Vec<Note>, String> {
+    let mut args = vec!["notes", "--format", "json"];
+    if let Some(c) = collection {
+        args.push("-c");
+        args.push(c);
+    }
+    let raw = run_qmd(&args)?;
     let parsed: Vec<NotesJson> = serde_json::from_str(raw.trim())
         .map_err(|e| format!("notes json parse error: {e}\nraw: {raw}"))?;
     Ok(parsed
@@ -76,9 +82,16 @@ pub fn list_notes() -> Result<Vec<Note>, String> {
         .collect())
 }
 
-/// Search notes: `qmd search --format json "<query>"`.
-pub fn search(query: &str) -> Result<Vec<Note>, String> {
-    let raw = run_qmd(&["search", "--format", "json", query])?;
+/// Search notes: `qmd search --format json "<query>"`. When `collection` is
+/// Some, only that collection is searched (`qmd search -c <name> "<query>"`).
+pub fn search(query: &str, collection: Option<&str>) -> Result<Vec<Note>, String> {
+    let mut args = vec!["search", "--format", "json"];
+    if let Some(c) = collection {
+        args.push("-c");
+        args.push(c);
+    }
+    args.push(query);
+    let raw = run_qmd(&args)?;
     let parsed: Vec<NotesJson> = match serde_json::from_str(raw.trim()) {
         Ok(v) => v,
         // `qmd search` returns "[]" for no hits; tolerate non-JSON gracefully.
@@ -212,7 +225,7 @@ mod tests {
             return; // qmd reindex not possible here — not a code failure
         }
         let abs = res.unwrap();
-        let listed = match list_notes() {
+        let listed = match list_notes(None) {
             Ok(v) => v.iter().any(|n| n.file.ends_with(&name)),
             Err(_) => return, // can't verify without a usable index
         };
