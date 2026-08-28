@@ -1786,6 +1786,48 @@ function listFiles(pathArg?: string): void {
   closeDb();
 }
 
+// List every active document across all collections. Used by the TUI to render
+// the note list pane. `--format json` emits a machine-readable array; otherwise
+// it prints a human-readable table (file, title, mtime).
+function listNotes(format: OutputFormat = "cli"): void {
+  const db = getDb();
+
+  const rows = db.prepare(`
+    SELECT d.collection, d.path, d.title, d.modified_at
+    FROM documents d
+    WHERE d.active = 1
+    ORDER BY d.modified_at DESC
+  `).all() as { collection: string; path: string; title: string; modified_at: string }[];
+
+  if (rows.length === 0) {
+    if (format === "json") {
+      console.log("[]");
+    } else {
+      console.log("No notes indexed. Run 'qmd collection add .' then 'qmd update'.");
+    }
+    closeDb();
+    return;
+  }
+
+  if (format === "json") {
+    const output = rows.map(r => ({
+      file: `${r.collection}/${r.path}`,
+      title: r.title,
+      mtime: r.modified_at,
+    }));
+    console.log(JSON.stringify(output, null, 2));
+    closeDb();
+    return;
+  }
+
+  console.log(`${c.bold}Notes (${rows.length}):${c.reset}\n`);
+  for (const r of rows) {
+    const mtime = formatLsTime(new Date(r.modified_at));
+    console.log(`${c.cyan}${r.path}${c.reset}  ${c.dim}${mtime}${c.reset}  ${c.dim}${r.collection}${c.reset}`);
+  }
+  closeDb();
+}
+
 // Format date/time like ls -l
 function formatLsTime(date: Date): string {
   const now = new Date();
@@ -4470,6 +4512,24 @@ if (isMain) {
 
     case "ls": {
       listFiles(cli.args[0]);
+      break;
+    }
+
+    case "notes": {
+      listNotes(cli.opts.format);
+      break;
+    }
+
+    case "tui": {
+      // Launch the Rust terminal UI (qmd-tui). Build it first with
+      // `cargo build -p qmd-tui` (or `cargo build --release` in ./tui).
+      const cargo = process.env.QMD_TUI_BIN || "qmd-tui";
+      const child = nodeSpawn(cargo, [], { stdio: "inherit", shell: false });
+      child.on("error", (err: NodeJS.ErrnoException) => {
+        console.error(`Failed to launch TUI (${cargo}): ${err.message}`);
+        console.error("Build it with: cd tui && cargo build --release");
+        process.exit(1);
+      });
       break;
     }
 
