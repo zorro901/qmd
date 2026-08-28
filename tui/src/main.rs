@@ -349,20 +349,26 @@ impl App {
             return false;
         }
 
-        // Search input mode captures everything.
+        // Search input mode captures everything and searches live as you type.
         if self.searching {
             match key.code {
                 KeyCode::Enter => {
+                    // Keep the live results; just leave the search box.
                     self.searching = false;
-                    self.run_search();
                 }
                 KeyCode::Esc => {
+                    // Cancel: clear the box and restore the full note list.
                     self.searching = false;
                     self.search_input.clear();
+                    self.reload_notes();
                 }
-                KeyCode::Char(c) => self.search_input.push(c),
+                KeyCode::Char(c) => {
+                    self.search_input.push(c);
+                    self.run_search();
+                }
                 KeyCode::Backspace => {
                     self.search_input.pop();
+                    self.run_search();
                 }
                 _ => {}
             }
@@ -887,6 +893,26 @@ mod app_tests {
         // A reload (e.g. Ctrl-R or post-save) clears the highlight query.
         app.reload_notes();
         assert_eq!(app.query, "", "reload clears the highlight query");
+    }
+
+    // Typing in search mode searches live (query is set on each keystroke) and
+    // Esc cancels back to the full list without leaving the query set.
+    #[test]
+    fn search_live_typing_and_esc_cancel() {
+        let mut app = App::new();
+        app.searching = true;
+        // Each character triggers run_search, which stores the query live.
+        for c in "git".chars() {
+            app.handle_key(key(c));
+        }
+        assert!(app.searching, "still in search mode while typing");
+        assert_eq!(app.query, "git", "query updates live as you type");
+        assert_eq!(app.search_input, "git", "search box holds the typed text");
+        // Esc cancels: clears the box and the query, leaves search mode.
+        app.handle_key(key_esc());
+        assert!(!app.searching, "esc leaves search mode");
+        assert_eq!(app.search_input, "", "esc clears the search box");
+        assert_eq!(app.query, "", "esc clears the highlight query");
     }
 }
 
