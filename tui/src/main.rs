@@ -918,6 +918,18 @@ fn highlight(text: &str, query: &str) -> Vec<Span<'static>> {
     spans
 }
 
+/// Build a `Text` for the note body with the active search query highlighted
+/// (bold yellow) on every line, reusing `highlight`. When `query` is empty the
+/// lines are rendered plainly. The concatenated text is always identical to
+/// `body`, so highlighting never drops or rewraps content.
+fn highlight_body(body: &str, query: &str) -> Text<'static> {
+    let lines: Vec<Line<'static>> = body
+        .lines()
+        .map(|line| Line::from(highlight(line, query)))
+        .collect();
+    Text::from(lines)
+}
+
 fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let search_line = if app.searching {
         Line::from(vec![
@@ -1022,7 +1034,7 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         f.render_widget(&ta, area);
     } else {
         let text = match &app.open_file {
-            Some(_) => Text::from(app.open_body.clone()),
+            Some(_) => highlight_body(&app.open_body, &app.query),
             None => Text::from(
                 "Select a note on the left, then press Enter to open it.\n\n\
                  Keys: / search · ↑↓ move · Enter open · n new note · e edit inline\n\
@@ -1363,6 +1375,39 @@ mod app_tests {
         let spans = highlight("nothing here", "xyz");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "nothing here");
+    }
+
+    // highlight_body wraps each line through highlight(): the search query is
+    // bold-yellow in the open note, and the concatenated text is byte-identical
+    // to the source body (no content dropped or rewrapped).
+    #[test]
+    fn highlight_body_marks_query_and_preserves_text() {
+        // Empty query -> one plain line per source line.
+        let t = highlight_body("alpha beta\ngamma", "");
+        assert_eq!(t.lines.len(), 2);
+        assert_eq!(t.lines[0].spans[0].content, "alpha beta");
+
+        // Query hits both lines; rebuild the text to confirm it's preserved.
+        let t = highlight_body("rust note\nother Rust line", "rust");
+        let rebuilt: String = t
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(rebuilt, "rust note\nother Rust line");
+        // First line contains one highlighted (yellow) span.
+        let any_yellow = t
+            .lines[0]
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(Color::Yellow));
+        assert!(any_yellow, "matched term should be highlighted");
     }
 
     // run_search stores a lowercased query for highlighting; a non-empty list

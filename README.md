@@ -101,8 +101,8 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | `Esc` | Cancel search / discard edit (asks if unsaved) / close overlay |
 | `q` | Quit (asks if there are unsaved changes) |
 
-Search matches are highlighted in the list, and the active collection shows in
-the list title.
+Search matches are highlighted in the list and in the open note (bold yellow),
+and the active collection shows in the list title.
 
 ### Using with AI Agents
 
