@@ -16,6 +16,7 @@ import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
+import { resolve as nodeResolve, relative as nodeRelative } from "node:path";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
@@ -1609,6 +1610,13 @@ export async function reindexCollection(
   collectionName: string,
   options?: {
     ignorePatterns?: string[];
+    /**
+     * When given, only these files are (re)indexed instead of scanning the
+     * whole collection. Paths may be absolute or relative to `collectionPath`.
+     * This turns `update` from O(all files) into O(provided paths), so a single
+     * add/edit on a huge collection no longer rescans everything (#perf).
+     */
+    paths?: string[];
     onProgress?: (info: ReindexProgress) => void;
   }
 ): Promise<ReindexResult> {
@@ -1620,18 +1628,33 @@ export async function reindexCollection(
     ...excludeDirs.map(d => `**/${d}/**`),
     ...(options?.ignorePatterns || []),
   ];
-  const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
-    cwd: collectionPath,
-    onlyFiles: true,
-    followSymbolicLinks: false,
-    dot: false,
-    ignore: allIgnore,
-  });
-  // Filter hidden files/folders
-  const files = allFiles.filter(file => {
-    const parts = file.split("/");
-    return !parts.some(part => part.startsWith("."));
-  });
+
+  let files: string[];
+  if (options?.paths && options.paths.length > 0) {
+    // Targeted mode: index only the caller-provided paths. Normalize each to a
+    // collection-relative posix path so the rest of the loop (which expects
+    // `relativeFile` values identical to what fastGlob yields) works unchanged.
+    files = options.paths.map(p => {
+      const abs = isPathInsideDir(collectionPath, nodeResolve(p))
+        ? nodeResolve(p)
+        : nodeResolve(collectionPath, p);
+      const rel = nodeRelative(collectionPath, abs);
+      return normalizePathSeparators(rel);
+    });
+  } else {
+    const allFiles: string[] = await fastGlob(splitGlobMask(globPattern), {
+      cwd: collectionPath,
+      onlyFiles: true,
+      followSymbolicLinks: false,
+      dot: false,
+      ignore: allIgnore,
+    });
+    // Filter hidden files/folders
+    files = allFiles.filter(file => {
+      const parts = file.split("/");
+      return !parts.some(part => part.startsWith("."));
+    });
+  }
 
   const total = files.length;
   let indexed = 0, updated = 0, unchanged = 0, processed = 0;
@@ -1739,19 +1762,23 @@ export async function reindexCollection(
     options?.onProgress?.({ file: relativeFile, current: processed, total });
   }
 
-  // Deactivate documents that no longer exist
-  const allActive = getActiveDocumentPaths(db, collectionName);
+  // Deactivate documents that no longer exist. In targeted mode we only visited
+  // the caller-provided paths, so "not seen" does NOT mean deleted — skip
+  // deactivation to avoid wiping unrelated documents (#perf targeted mode).
   let removed = 0;
-  for (const path of allActive) {
-    if (!seenPaths.has(path)) {
-      deactivateDocument(db, collectionName, path);
-      removed++;
+  if (!options?.paths || options.paths.length === 0) {
+    const allActive = getActiveDocumentPaths(db, collectionName);
+    for (const path of allActive) {
+      if (!seenPaths.has(path)) {
+        deactivateDocument(db, collectionName, path);
+        removed++;
+      }
     }
   }
 
   const orphanedCleaned = cleanupOrphanedContent(db);
 
-  return { indexed, updated, unchanged, removed, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
+  return { indexed, updated, unchanged, removed: removed ?? 0, orphanedCleaned, skipped: skippedFiles.length, skippedFiles };
 }
 
 export type EmbedFailure = {

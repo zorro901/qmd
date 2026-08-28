@@ -3451,6 +3451,75 @@ describe("Vector Table", () => {
 
     await cleanupTestDb(store);
   });
+
+  test("targeted reindex with paths only visits the given file (O(changed))", async () => {
+    const store = await createTestStore();
+    const collectionName = "targeted";
+    const collectionPath = join(testDir, `targeted-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    await writeFile(join(collectionPath, "a.md"), "# A\n\nalpha body\n");
+    await writeFile(join(collectionPath, "b.md"), "# B\n\nbeta body\n");
+    await writeFile(join(collectionPath, "c.md"), "# C\n\ngamma body\n");
+
+    try {
+      const full = await reindexCollection(store, collectionPath, "**/*.md", collectionName);
+      expect(full.indexed).toBe(3);
+
+      // Touch b.md with new content; targeted reindex of only b.md must update
+      // exactly one doc and must not deactivate a.md / c.md. Advance the clock
+      // past the 1-second mtime granularity so the change is detectable
+      // (the mtime-skip path compares wall-clock mtime, not content).
+      await new Promise(r => setTimeout(r, 1100));
+      await writeFile(join(collectionPath, "b.md"), "# B\n\nbeta body UPDATED\n");
+
+      const targeted = await reindexCollection(store, collectionPath, "**/*.md", collectionName, {
+        paths: [join(collectionPath, "b.md")],
+      });
+      expect(targeted.updated).toBe(1);
+      expect(targeted.indexed).toBe(0);
+      expect(targeted.removed).toBe(0);
+
+      const active = store.db.prepare(
+        `SELECT path FROM documents WHERE collection = ? AND active = 1 ORDER BY path`
+      ).all(collectionName) as { path: string }[];
+      expect(active.map(r => r.path)).toEqual(["a.md", "b.md", "c.md"]);
+
+      const bBody = store.db.prepare(
+        `SELECT content.doc as body FROM documents d JOIN content ON content.hash = d.hash WHERE d.collection = ? AND d.path = ? AND d.active = 1`
+      ).get(collectionName, "b.md") as { body: string };
+      expect(bBody.body).toContain("UPDATED");
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("targeted reindex treats a path outside the pattern as OOB and skips it", async () => {
+    const store = await createTestStore();
+    const collectionName = "targeted-oob";
+    const collectionPath = join(testDir, `targeted-oob-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const outside = join(testDir, `targeted-oob-outside-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(collectionPath, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(collectionPath, "a.md"), "# A\n\nalpha\n");
+    await writeFile(join(outside, "secret.md"), "# Secret\n\nOUTSIDE_TOKEN\n");
+
+    try {
+      const result = await reindexCollection(store, collectionPath, "**/*.md", collectionName, {
+        paths: [join(collectionPath, "a.md"), join(outside, "secret.md")],
+      });
+      expect(result.skippedFiles.some(s => s.code === "OUTSIDE_COLLECTION")).toBe(true);
+
+      const bodies = store.db.prepare(
+        `SELECT content.doc as body FROM documents d JOIN content ON content.hash = d.hash WHERE d.collection = ? AND d.active = 1`
+      ).all(collectionName) as { body: string }[];
+      expect(bodies.map(b => b.body).join("")).not.toContain("OUTSIDE_TOKEN");
+    } finally {
+      await rm(collectionPath, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+      await cleanupTestDb(store);
+    }
+  });
 });
 
 // =============================================================================

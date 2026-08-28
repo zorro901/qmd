@@ -892,7 +892,7 @@ function manageTrust(subcommand?: string): void {
   console.log(`${c.dim}Editing a hook, out-of-project path, or custom model will ask again. Revoke with 'qmd trust revoke'.${c.reset}`);
 }
 
-async function updateCollections(): Promise<void> {
+async function updateCollections(paths?: string[]): Promise<void> {
   // Prompt before opening the store so an approval is visible to getStore (#889).
   const allowed = await resolveLocalConfigTrust();
 
@@ -916,6 +916,42 @@ async function updateCollections(): Promise<void> {
   // else's choices until the user says otherwise (#886, #889).
   const hooksAllowed = allowed;
   const configPath = getConfigPath();
+
+  // In targeted mode (--path) we only reindex the given files, so collection
+  // update commands and per-collection headers are irrelevant. Short-circuit
+  // straight to reindexing each collection with the provided paths.
+  if (paths && paths.length > 0) {
+    console.log(`${c.bold}Updating ${collections.length} collection(s) for ${paths.length} path(s)...${c.reset}\n`);
+    for (let i = 0; i < collections.length; i++) {
+      const col = collections[i];
+      if (!col) continue;
+      const startTime = Date.now();
+      const result = await reindexCollection(storeInstance, col.pwd, col.glob_pattern, col.name, {
+        paths,
+        onProgress: (info) => {
+          const elapsed = (Date.now() - startTime) / 1000;
+          const rate = info.current / elapsed;
+          const remaining = (info.total - info.current) / rate;
+          const eta = info.current > 2 ? ` ETA: ${formatETA(remaining)}` : "";
+          if (isTTY) process.stderr.write(`\rIndexing: ${info.current}/${info.total}${eta}        `);
+        },
+      });
+      progress.clear();
+      console.log(`\nIndexed: ${result.indexed} new, ${result.updated} updated, ${result.unchanged} unchanged, ${result.removed} removed`);
+      reportSkippedReads(result.skippedFiles);
+      if (result.orphanedCleaned > 0) {
+        console.log(`Cleaned up ${result.orphanedCleaned} orphaned content hash(es)`);
+      }
+      console.log("");
+    }
+    const needsEmbedding = getHashesNeedingEmbedding(db);
+    closeDb();
+    console.log(`${c.green}✓ Targeted update complete.${c.reset}`);
+    if (needsEmbedding > 0) {
+      console.log(`\nRun 'qmd embed' to update embeddings (${needsEmbedding} unique hashes need vectors)`);
+    }
+    return;
+  }
 
   console.log(`${c.bold}Updating ${collections.length} collection(s)...${c.reset}\n`);
 
@@ -3051,6 +3087,7 @@ function parseCLI() {
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
       // Update options
       pull: { type: "boolean" },  // git pull before update
+      path: { type: "string", multiple: true },  // qmd update --path a.md b.md (targeted reindex, O(changed))
       refresh: { type: "boolean" },
       progress: { type: "boolean" },  // qmd pull: show node-llama-cpp download progress bar
       "dry-run": { type: "boolean" },  // cleanup: report what would be removed
@@ -3586,6 +3623,7 @@ function showHelp(): void {
   console.log("  qmd init                      - Create a project-local .qmd index");
   console.log("  qmd status                    - View index + collection health");
   console.log("  qmd update [--pull]           - Re-index collections (optionally git pull first)");
+  console.log("  qmd update [--path <f>...]    - Re-index only the given file(s), O(changed). Positional paths also accepted.");
   console.log("  qmd trust [list|revoke]       - Approve a checked-in .qmd config's hooks/paths/models");
   console.log("  qmd embed [-f] [-c <name>]    - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
@@ -4619,9 +4657,19 @@ if (isMain) {
       await showDoctor();
       break;
 
-    case "update":
-      await updateCollections();
+    case "update": {
+      // Targeted reindex: support both `--path a.md --path b.md` and the
+      // git-style positional form `qmd update a.md b.md`.
+      const positionalPaths = (cli.args as string[] | undefined) ?? [];
+      const flagPaths = (cli.values.path as string[] | undefined) ?? [];
+      const targets = [...flagPaths, ...positionalPaths];
+      void (
+        cli.values.glob &&
+        console.warn("QMD Warning: --glob is ignored by 'update'; it only applies when adding a collection.")
+      );
+      await updateCollections(targets.length > 0 ? targets : undefined);
       break;
+    }
 
     case "trust":
       manageTrust(cli.args[0]);
