@@ -142,6 +142,13 @@ impl App {
     }
 
     fn reload_notes(&mut self) {
+        // Anchor on the currently selected note id so the cursor lands back on
+        // the same note after the list is rebuilt (instead of snapping to top).
+        let anchor = self
+            .list_state
+            .selected()
+            .and_then(|i| self.notes.get(i).map(|n| n.file.clone()));
+        let prev_sel = self.list_state.selected();
         let coll: Option<&str> = self.collection.as_deref();
         match qmd::list_notes(coll) {
             Ok(notes) => {
@@ -155,22 +162,30 @@ impl App {
                         None => format!("{} notes", self.notes.len()),
                     };
                 }
-                if self.list_state.selected().is_none() && !self.notes.is_empty() {
-                    self.list_state.select(Some(0));
-                }
-                // Keep previewing the open note if it is still in the (refreshed)
-                // list; otherwise preview whatever is now selected so the right
-                // pane is never left pointing at a stale note.
-                if self
-                    .open_file
-                    .as_ref()
-                    .map(|f| self.notes.iter().any(|n| &n.file == f))
-                    .unwrap_or(false)
-                {
-                    // already showing a note that survived the reload
-                } else if !self.notes.is_empty() {
-                    self.preview_selected();
+                if !self.notes.is_empty() {
+                    // Land the cursor back on the same note by id (list order can
+                    // shift between loads); fall back to the old position, then top.
+                    let pos = anchor
+                        .as_ref()
+                        .and_then(|id| self.notes.iter().position(|n| &n.file == id))
+                        .or(prev_sel.filter(|p| *p < self.notes.len()))
+                        .unwrap_or(0);
+                    self.list_state.select(Some(pos));
+                    // Keep the currently open note if it survived the reload;
+                    // otherwise re-preview whatever is now selected so the right
+                    // pane never points at a stale note.
+                    if self
+                        .open_file
+                        .as_ref()
+                        .map(|f| self.notes.iter().any(|n| &n.file == f))
+                        .unwrap_or(false)
+                    {
+                        // already showing a note that survived the reload
+                    } else {
+                        self.preview_selected();
+                    }
                 } else {
+                    self.list_state.select(None);
                     self.open_file = None;
                     self.open_body.clear();
                     self.open_abs = None;
@@ -1350,6 +1365,37 @@ mod app_tests {
         // Clean up both files.
         let _ = qmd::delete_note(&copy_id);
         let _ = qmd::delete_note(&old_id);
+    }
+
+    // Ctrl-R reloads the list but must keep the cursor on the same note (by id),
+    // not snap back to the top. Skips without a usable indexed collection.
+    #[test]
+    fn reload_keeps_selected_note() {
+        let dir: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
+            Ok(d) => d.into(),
+            Err(_) => return,
+        };
+        let colls = match qmd::list_collections() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let _ = colls.iter().find(|(_, p)| p == &dir); // ensure a usable collection exists
+        let mut app = App::new();
+        if app.notes.len() < 3 {
+            return; // need several rows to prove the selection doesn't reset
+        }
+        // Start somewhere in the middle.
+        let target = 2.min(app.notes.len() - 1);
+        app.list_state.select(Some(target));
+        let want_id = app.notes[target].file.clone();
+
+        app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ));
+
+        let sel = app.list_state.selected().expect("a row stays selected");
+        assert_eq!(app.notes[sel].file, want_id, "same note selected after reload");
     }
 
     // Quit with unsaved edits must NOT exit (handle_key returns false); a second
