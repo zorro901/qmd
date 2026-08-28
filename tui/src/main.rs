@@ -12,6 +12,7 @@
 //!   /  or Ctrl-F   focus the search box
 //!   ↑ ↓            move through the note list
 //!   Enter          open the selected note in the right pane
+//!   n              create a new note (enter "<collection>/<file>.md")
 //!   e              edit the open note inline (tui-textarea)
 //!   Esc            leave search · cancel inline edit (discard) · quit from root
 //!   Ctrl-S         save the inline edit (write file + reindex)
@@ -52,6 +53,8 @@ struct App {
     dirty: bool,
     edit_mode: bool,
     textarea: TextArea<'static>,
+    creating: bool,
+    new_input: String,
 }
 
 impl App {
@@ -68,6 +71,8 @@ impl App {
             dirty: false,
             edit_mode: false,
             textarea: TextArea::default(),
+            creating: false,
+            new_input: String::new(),
         };
         app.reload_notes();
         app
@@ -140,6 +145,74 @@ impl App {
         self.textarea = TextArea::from(self.open_body.split('\n'));
         self.edit_mode = true;
         self.status = "editing — Ctrl-S save · Esc cancel".into();
+    }
+
+    /// Begin creating a new note: pick the first collection, then prompt for a
+    /// filename in `new_input`.
+    fn start_create(&mut self) {
+        match qmd::list_collections() {
+            Ok(colls) if !colls.is_empty() => {
+                // Prefill the input with the first collection name as a prefix.
+                let (name, _) = &colls[0];
+                self.new_input = format!("{name}/");
+                self.creating = true;
+                self.status = "new note — type a filename, Enter to create".into();
+            }
+            Ok(_) => self.status = "no collections; run 'qmd collection add .' first".into(),
+            Err(e) => self.status = format!("error: {e}"),
+        }
+    }
+
+    /// Finish the filename prompt: create the empty file inside its collection
+    /// and open it in the inline editor.
+    fn confirm_create(&mut self) {
+        let raw = self.new_input.trim().to_string();
+        self.creating = false;
+        if raw.is_empty() {
+            self.status = "cancelled".into();
+            return;
+        }
+        // Split "<collection>/<path>" so we know which directory to write into.
+        let (coll_name, rel) = match raw.split_once('/') {
+            Some((c, p)) if !c.is_empty() && !p.is_empty() => (c.to_string(), p.to_string()),
+            _ => {
+                self.status = "use '<collection>/<file>.md' format".into();
+                return;
+            }
+        };
+        let file_name = if rel.ends_with(".md") {
+            rel
+        } else {
+            format!("{rel}.md")
+        };
+
+        let colls = match qmd::list_collections() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("error: {e}");
+                return;
+            }
+        };
+        let dir = match colls.iter().find(|(n, _)| n == &coll_name) {
+            Some((_, p)) => p.clone(),
+            None => {
+                self.status = format!("unknown collection '{coll_name}'");
+                return;
+            }
+        };
+
+        match qmd::create_note(&dir, &file_name, "") {
+            Ok(abs) => {
+                self.open_file = Some(format!("{coll_name}/{file_name}"));
+                self.open_body = String::new();
+                self.open_abs = Some(abs);
+                self.textarea = TextArea::default();
+                self.edit_mode = true;
+                self.dirty = true;
+                self.status = "new note — Ctrl-S save".into();
+            }
+            Err(e) => self.status = format!("create error: {e}"),
+        }
     }
 
     /// Persist the inline edit: write the file, then reindex just that file.
@@ -232,10 +305,29 @@ fn run_app<B: ratatui::backend::Backend>(
                     continue;
                 }
 
+                // New-note filename prompt captures keys.
+                if app.creating {
+                    match key.code {
+                        KeyCode::Enter => app.confirm_create(),
+                        KeyCode::Esc => {
+                            app.creating = false;
+                            app.new_input.clear();
+                            app.status = "cancelled".into();
+                        }
+                        KeyCode::Char(c) => app.new_input.push(c),
+                        KeyCode::Backspace => {
+                            app.new_input.pop();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 match key.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('/') => app.searching = true,
                     KeyCode::Char('e') => app.start_edit(),
+                    KeyCode::Char('n') => app.start_create(),
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         app.save_edit()
                     }
@@ -290,6 +382,12 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             "editing — Ctrl-S save · Esc cancel",
             Style::default().fg(Color::Green),
         )])
+    } else if app.creating {
+        Line::from(vec![
+            Span::styled("new › ", Style::default().fg(Color::Cyan)),
+            Span::raw(&app.new_input),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ])
     } else {
         Line::from(vec![Span::styled(
             "press / to search",
@@ -347,10 +445,58 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Some(_) => Text::from(app.open_body.clone()),
             None => Text::from(
                 "Select a note on the left, then press Enter to open it.\n\n\
-                 Keys: / search · ↑↓ move · Enter open · e edit inline · Ctrl-S save · q quit",
+                 Keys: / search · ↑↓ move · Enter open · n new note · e edit inline · Ctrl-S save · q quit",
             ),
         };
         let para = Paragraph::new(text).block(block);
         f.render_widget(para, area);
+    }
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    // Headless integration test for the "new note" flow: start_create() ->
+    // confirm_create() -> type into the textarea -> save_edit(). Verifies the
+    // file is written with the typed content and reindexed. Skips without a
+    // usable indexed collection (QMD_TUI_TEST_COLL_DIR + working qmd index).
+    #[test]
+    fn create_then_save_roundtrip() {
+        let dir = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let name = format!("qmd-tui-it-{}.md", std::process::id());
+        let mut app = App::new();
+        // Force the create prompt to target our test collection.
+        app.start_create();
+        if !app.creating {
+            return; // no collections available in this index
+        }
+        // Prefill "<coll>/<name>" using the first collection prefix.
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        assert!(app.open_abs.is_some(), "note should open after create");
+        assert!(app.edit_mode, "should enter edit mode after create");
+
+        // Type content and save.
+        app.textarea = TextArea::from(["# Created in TUI\nhello integration\n"]);
+        app.save_edit();
+        assert!(!app.dirty, "save should clear dirty flag");
+
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(
+            content.contains("hello integration"),
+            "saved file should contain typed text; got: {content:?}"
+        );
+        // Clean up: remove the file and reindex so the index stays consistent.
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
     }
 }
