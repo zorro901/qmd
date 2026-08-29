@@ -101,7 +101,7 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | click a list row | Select (and preview) that note |
 | `Ctrl-R` | Reload the note list |
 | `?` | Show keybindings |
-| `Esc` | Cancel search / discard edit (asks if unsaved) / close overlay |
+| `Esc` | In edit mode: save & exit · else cancel search / close overlay |
 | `q` | Quit (asks if there are unsaved changes) |
 | `Ctrl-C` | Quit immediately from anywhere (panic hatch) |
 

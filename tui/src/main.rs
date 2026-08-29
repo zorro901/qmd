@@ -62,7 +62,6 @@ use tui_textarea::{Input, TextArea};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     Quit,
-    CancelEdit,
     Delete,
 }
 
@@ -646,11 +645,6 @@ impl App {
                     self.confirm_pending = None;
                     match confirm {
                         Confirm::Quit => return true,
-                        Confirm::CancelEdit => {
-                            self.dirty = false;
-                            self.edit_mode = false;
-                            self.status = "edit discarded".into();
-                        }
                         Confirm::Delete => self.delete_selected(),
                     }
                 }
@@ -679,14 +673,13 @@ impl App {
         // Inline-edit mode captures keys for tui-textarea.
         if self.edit_mode {
             match key.code {
+                // Esc saves the inline edit and leaves edit mode. This is the
+                // plain, modifier-free way out of editing (no Fn/Ctrl/Alt key
+                // needed); it always exits so the user is never trapped, even
+                // if the save fails. Use Ctrl-C to hard-quit without saving.
                 KeyCode::Esc => {
-                    if self.dirty {
-                        self.confirm_pending = Some(Confirm::CancelEdit);
-                        self.status = "discard changes? Enter to discard, Esc to keep editing".into();
-                    } else {
-                        self.edit_mode = false;
-                        self.status = "edit discarded".into();
-                    }
+                    let _ = self.save_edit();
+                    self.edit_mode = false;
                 }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.save_edit()
@@ -1065,7 +1058,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("?", "show this help"),
     ("Ctrl-R", "reload the note list"),
     ("q", "quit (asks if there are unsaved changes)"),
-    ("Esc", "cancel search / discard edit (asks) / close"),
+    ("Esc", "in edit mode: save & exit · else cancel search / close overlay"),
 ];
 
 fn self_collection_active(app: &App, name: &str) -> bool {
@@ -1123,7 +1116,7 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         ])
     } else if app.edit_mode {
         Line::from(vec![Span::styled(
-            "editing — Ctrl-S save · Esc cancel",
+            "editing — Esc saves & exits · Ctrl-C quit",
             Style::default().fg(Color::Green),
         )])
     } else if app.creating {
@@ -1631,22 +1624,18 @@ mod app_tests {
         assert_eq!(app.open_body, "SENTINEL", "already-open note is not re-fetched");
     }
 
-    // Esc while editing dirty content arms a discard prompt; Enter discards.
+    // Esc in edit mode saves the inline edit and leaves edit mode immediately
+    // (never trapping the user behind a prompt), with no confirm arm.
     #[test]
-    fn esc_while_editing_asks_before_discard() {
+    fn esc_while_editing_saves_and_exits() {
         let mut app = App::new();
         app.edit_mode = true;
         app.dirty = true;
-        // Esc arms the CancelEdit prompt (does not leave edit mode yet).
         let quit = app.handle_key(key_esc());
         assert!(!quit);
-        assert!(app.edit_mode, "edit mode stays until confirmed");
-        assert!(app.confirm_pending.is_some());
-        // Enter discards.
-        let quit2 = app.handle_key(key_enter());
-        assert!(!quit2);
-        assert!(!app.edit_mode, "edit mode left after discard confirmed");
-        assert!(!app.dirty, "dirty cleared after discard");
+        assert!(!app.edit_mode, "edit mode exited on Esc");
+        assert!(app.confirm_pending.is_none(), "no confirm prompt armed");
+        assert!(!app.dirty, "dirty cleared after save");
     }
 
     // Drive the real key path (handle_key) to type into the textarea, save via
