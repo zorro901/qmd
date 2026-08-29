@@ -34,8 +34,8 @@ use std::io;
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -101,6 +101,9 @@ struct App {
     picking: bool,
     /// When true, the keybinding help overlay is shown (dismissed by any key).
     show_help: bool,
+    /// Screen rectangle of the note list, refreshed each draw, so mouse clicks
+    /// can be mapped to a list row for click-to-select.
+    list_area: Rect,
 }
 
 impl App {
@@ -130,6 +133,7 @@ impl App {
             collection_idx: 0,
             picking: false,
             show_help: false,
+            list_area: Rect::ZERO,
         };
         app.reload_notes();
         // Open the first note so the right pane is populated immediately
@@ -800,8 +804,9 @@ impl App {
         false
     }
 
-    /// Handle mouse events: wheel scrolling moves the note body. Other mouse
-    /// interactions are ignored (the list uses arrow keys).
+    /// Handle mouse events: wheel scrolling moves the note body; clicking a row
+    /// in the list selects (and previews) it. Other mouse interactions are
+    /// ignored.
     fn handle_mouse(&mut self, m: MouseEvent) {
         if self.edit_mode {
             return;
@@ -812,6 +817,24 @@ impl App {
             }
             MouseEventKind::ScrollUp => {
                 self.scroll_body(-3, self.open_body.lines().count(), usize::MAX);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Map the click to a list row. The list has a 1-line border, so
+                // the first item sits one row below the area's top.
+                let inner_top = self.list_area.y.saturating_add(1);
+                if m.row < inner_top || self.list_area.x > m.column || m.column > self.list_area.right() {
+                    return;
+                }
+                let row = (m.row - inner_top) as usize;
+                if row < self.notes.len() {
+                    let cur = self.list_state.selected().unwrap_or(0);
+                    // A click on the already-selected row is a no-op; otherwise
+                    // move the selection (which previews the note).
+                    if row != cur {
+                        self.list_state.select(Some(row));
+                        self.preview_selected();
+                    }
+                }
             }
             _ => {}
         }
@@ -982,6 +1005,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("PgUp/PgDn", "scroll the note body"),
     ("Home/End", "jump to top / bottom of body"),
     ("mouse wheel", "scroll the note body"),
+    ("click", "select a note in the list (body previews)"),
     ("?", "show this help"),
     ("Ctrl-R", "reload the note list"),
     ("q", "quit (asks if there are unsaved changes)"),
@@ -1032,6 +1056,9 @@ fn highlight_body(body: &str, query: &str) -> Text<'static> {
 }
 
 fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    // Remember the list's screen rectangle so mouse clicks can be mapped to a
+    // row (click-to-select) in handle_mouse.
+    app.list_area = area;
     let search_line = if app.searching {
         Line::from(vec![
             Span::styled("› ", Style::default().fg(Color::Yellow)),
@@ -1459,6 +1486,53 @@ mod app_tests {
         assert_eq!(app.list_state.selected(), Some(1), "Down == j");
         app.handle_key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
         assert_eq!(app.list_state.selected(), Some(0), "Up == k");
+    }
+
+    // Clicking a row in the list selects (and previews) that note. The click is
+    // mapped using the list_area captured during the last draw.
+    #[test]
+    fn mouse_click_selects_row() {
+        let mut app = App::new();
+        app.notes = (0..5).map(|i| qmd::Note {
+            file: format!("t/n{i}.md"),
+            title: format!("n{i}"),
+            mtime: String::new(),
+        }).collect();
+        app.list_state.select(Some(0));
+        // Simulate the drawn list rectangle: top border at y=2, first row at y=3.
+        let area = Rect::new(0, 2, 40, 20);
+        app.list_area = area;
+
+        // Click row index 3 (screen y = 2 border + 1 + 3).
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.handle_mouse(click);
+        assert_eq!(app.list_state.selected(), Some(3), "click selects row 3");
+        assert_eq!(app.open_file.as_deref(), Some("t/n3.md"), "click previews the note");
+
+        // Clicking the already-selected row is a no-op (still row 3).
+        let click2 = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.handle_mouse(click2);
+        assert_eq!(app.list_state.selected(), Some(3), "re-click keeps selection");
+
+        // A click outside the list column is ignored.
+        let outside = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.right() + 2,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        };
+        app.handle_mouse(outside);
+        assert_eq!(app.list_state.selected(), Some(3), "click outside list ignored");
     }
 
     // App::new loads the index and immediately previews the first note, so the
