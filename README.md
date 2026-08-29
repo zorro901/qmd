@@ -95,7 +95,7 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | `y` | Duplicate the selected note into a copy (same collection) |
 | `e` | Edit the open note inline (tui-textarea) |
 | `d` | Delete the selected note (asks to confirm) |
-| `Ctrl-S` | Save the inline edit (write file + reindex) |
+| `Ctrl-S` / `Alt-S` / `F2` | Save the inline edit (write file + reindex) |
 | `PgUp` / `PgDn`, `Home` / `End`, mouse wheel | Scroll the note body |
 | `Ctrl-R` | Reload the note list |
 | `?` | Show keybindings |

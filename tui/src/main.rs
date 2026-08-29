@@ -21,7 +21,7 @@
 //!   d              delete the selected note (asks to confirm)
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
 //!   Esc            leave search · discard inline edit (asks if unsaved) · quit prompt
-//!   Ctrl-S         save the inline edit (write file + reindex)
+//!   Ctrl-S / Alt-S / F2   save the inline edit (write file + reindex)
 //!   Ctrl-R         reload the note list
 //!   q              quit (asks if there are unsaved changes)
 //!
@@ -653,6 +653,13 @@ impl App {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.save_edit()
                 }
+                // Alt-S (Meta+S) and F2 are flow-control-safe alternatives to
+                // Ctrl-S: on some terminals/SSH sessions Ctrl-S is eaten by XOFF
+                // before it reaches the TUI, so saving would silently fail.
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.save_edit()
+                }
+                KeyCode::F(2) => self.save_edit(),
                 _ => {
                     self.textarea.input(Input::from(key));
                     self.dirty = true;
@@ -971,7 +978,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("y", "duplicate the selected note into a copy (same collection)"),
     ("e", "edit the open note inline"),
     ("d", "delete the selected note (asks)"),
-    ("Ctrl-S", "save the inline edit (write + reindex)"),
+    ("Ctrl-S / Alt-S / F2", "save the inline edit (write + reindex)"),
     ("PgUp/PgDn", "scroll the note body"),
     ("Home/End", "jump to top / bottom of body"),
     ("mouse wheel", "scroll the note body"),
@@ -1561,6 +1568,59 @@ mod app_tests {
             .unwrap_or(false);
         assert!(selected_is_open, "saved note should be re-selected in the list");
         // Clean up.
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
+    }
+
+    // Saving must also work via Alt-S (Meta+S) and F2, which are not subject to
+    // terminal flow control (XOFF) the way Ctrl-S is — important over SSH where
+    // Ctrl-S can be eaten before it reaches the TUI. Needs a usable index.
+    #[test]
+    fn alt_s_and_f2_save_in_edit_mode() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-alt-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        assert!(app.edit_mode, "editing after create");
+
+        // Type some text.
+        for c in "save via alt-s".chars() {
+            app.handle_key(key(c));
+        }
+        assert!(app.dirty);
+
+        // Alt-S saves.
+        app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::ALT,
+        ));
+        assert!(!app.dirty, "Alt-S should clear dirty");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(content.contains("save via alt-s"), "Alt-S wrote the file; got: {content:?}");
+
+        // Re-enter edit to prove F2 also saves.
+        app.start_edit();
+        for c in " and f2".chars() {
+            app.handle_key(key(c));
+        }
+        app.handle_key(event::KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()));
+        assert!(!app.dirty, "F2 should clear dirty");
+        let content2 = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(
+            content2.contains("save via alt-s") && content2.contains(" and f2"),
+            "F2 wrote the file; got: {content2:?}"
+        );
+
         let _ = std::fs::remove_file(&abs);
         let _ = qmd::save(&abs, "");
     }
