@@ -78,8 +78,16 @@ CLI (Rust + ratatui, in `tui/`). It shells out to `qmd` for every read and
 write, so files stay the single source of truth. Build it once, then launch:
 
 ```sh
-cd tui && cargo build --release   # stages bin/qmd-tui; also done by `npm run build`
+cd tui && cargo build --release   # binary at tui/target/release/qmd-tui
 qmd tui                            # or set QMD_TUI_BIN to a custom binary
+```
+
+`cargo build` alone does NOT copy the binary to `bin/qmd-tui` — that staging
+step (needed for `qmd tui` to find it without a PATH entry) happens via
+`npm run build`, or manually:
+
+```sh
+cp tui/target/release/qmd-tui bin/qmd-tui
 ```
 
 **Keys**

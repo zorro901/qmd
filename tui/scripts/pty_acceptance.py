@@ -7,12 +7,16 @@ end-to-end acceptance path that unit tests cannot cover: unit tests drive the
 App struct directly, this exercises the crossterm event loop, the terminal,
 and the qmd child processes.
 
-Two scenarios are verified:
+Two scenarios are verified (the core save paths):
 
 1. autosave  — press 'e', type a marker, wait past the 2s debounce WITHOUT
    pressing any save key, and confirm the marker is on disk BEFORE Esc.
 2. esc-save  — open an EXISTING note with Enter, press 'e', type, press Esc,
    and confirm the marker lands on disk.
+
+Edge cases (opt-in with --full): multi-line edit (Enter inside the editor
+must NOT trigger open_selected), Ctrl-C in edit mode (saves & exits edit,
+does NOT quit), and Ctrl-C outside edit mode (panic hatch, quits).
 
 Requirements: python3, a qmd index with a test collection. Configure via env:
 
@@ -23,7 +27,7 @@ Requirements: python3, a qmd index with a test collection. Configure via env:
                         missing, reusing the TUI's own index env vars)
 
 Usage (from tui/):
-    QMD_BIN=/path/to/qmd python3 scripts/pty_acceptance.py
+    QMD_BIN=/path/to/qmd python3 scripts/pty_acceptance.py [--full]
 
 Exit 0 only if BOTH scenarios pass. The PTY quirk to know about: the pty must
 be given a real window size via TIOCSWINSZ, otherwise ratatui renders nothing
@@ -45,6 +49,7 @@ import time
 DEBOUNCE_SECS = 2.0
 AUTOSAVE_WAIT = DEBOUNCE_SECS + 1.0
 SAVE_POLL_SECS = 8.0
+FULL = "--full" in sys.argv[1:]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TUI_DIR = os.path.dirname(SCRIPT_DIR)
@@ -86,9 +91,10 @@ def ensure_collection(env, cwd):
                        env=env, check=False, cwd=cwd)
 
 
-def run_session(env, cwd, label, steps):
+def run_session(env, cwd, label, steps, kill=True):
     """Fork the TUI on a PTY, run steps(list of (delay, bytes_or_None)),
-    return (child_output, tui_pid, fd) after steps complete."""
+    return (accumulated_output, tui_pid, fd) with the process cleaned up
+    (kill=True) or left running for the caller to inspect (kill=False)."""
     pid, fd = pty.fork()
     if pid == 0:
         os.chdir(cwd)
@@ -115,16 +121,17 @@ def run_session(env, cwd, label, steps):
                 os.write(fd, keys)
             drain(delay)
     finally:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        os.close(fd)
-    return out
+        if kill:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            os.close(fd)
+    return out, pid, fd
 
 
 def vis(raw):
@@ -150,6 +157,29 @@ def wait_for_marker(path, marker, timeout):
     return False
 
 
+def alive(pid):
+    try:
+        p, _ = os.waitpid(pid, os.WNOHANG)
+        return p == 0
+    except ChildProcessError:
+        return False
+
+
+def kill_session(pid, fd):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def main():
     cwd = os.environ.get("QMD_ACC_COLL_DIR") or "/tmp/qmd-tui-acceptance"
     os.makedirs(cwd, exist_ok=True)
@@ -160,6 +190,7 @@ def main():
 
     print(f"binary: {env['QMD_TUI_BIN']}")
     print(f"collection dir: {cwd}")
+    results = {}
 
     # --- Scenario 1: autosave fires BEFORE Esc (no save key pressed) --------
     marker1 = f"AUTOSAVE-OK-{os.getpid()}"
@@ -173,15 +204,15 @@ def main():
         (0.5, marker1.encode()),     # type marker
         (AUTOSAVE_WAIT, None),       # wait past debounce; press NOTHING
     ])
-    before_esc = marker1 in open(note).read()
-    print(f"[autosave] marker on disk BEFORE Esc: {before_esc}")
+    results["autosave-before-esc"] = marker1 in open(note).read()
+    print(f"[autosave] marker on disk BEFORE Esc: {results['autosave-before-esc']}")
 
     # --- Scenario 2: Esc saves on an existing note --------------------------
     marker2 = f"ESC-SAVE-OK-{os.getpid()}"
     with open(note, "w") as f:
         f.write("# acceptance baseline\n")
 
-    raw = run_session(env, cwd, "esc-save", [
+    run_session(env, cwd, "esc-save", [
         (3.0, None),                 # startup
         (0.5, b"\r"),                # Enter re-opens notes[0] explicitly
         (1.5, None),
@@ -190,15 +221,63 @@ def main():
         (0.6, None),
         (SAVE_POLL_SECS, b"\x1b"),   # Esc: save & exit; poll while draining
     ])
-    esc_ok = marker2 in open(note).read()
-    print(f"[esc-save] marker on disk after Esc: {esc_ok}")
+    results["esc-save-existing"] = marker2 in open(note).read()
+    print(f"[esc-save] marker on disk after Esc: {results['esc-save-existing']}")
 
-    if before_esc and esc_ok:
-        print("PASS: autosave and Esc-save both verified on the real binary")
+    # --- Edge cases (opt-in: --full) ----------------------------------------
+    if FULL:
+        # 3: Enter inside the editor inserts a newline; it must NOT open the
+        # next list row. Two lines must be on disk afterwards.
+        marker3 = f"MULTILINE-OK-{os.getpid()}"
+        with open(note, "w") as f:
+            f.write("# acceptance baseline\n")
+        out3, pid, fd = run_session(env, cwd, "multiline", [
+            (3.0, None),
+            (1.0, b"e"),
+            (0.5, marker3.encode()),
+            (0.3, b"\r"),            # newline INSIDE the editor
+            (0.5, b"line-two"),
+            (SAVE_POLL_SECS, b"\x1b"),
+        ], kill=False)
+        kill_session(pid, fd)
+        body = open(note).read()
+        ok3 = marker3 in body and "line-two" in body and "\n" in body
+        results["multiline-enter"] = ok3
+        print(f"[multiline] Enter inserted a newline, both lines on disk: {ok3}")
+
+        # 4: Ctrl-C in edit mode saves & exits edit mode; the app STAYS alive.
+        marker4 = f"CTRLC-SAVE-OK-{os.getpid()}"
+        with open(note, "w") as f:
+            f.write("# acceptance baseline\n")
+        out4, pid, fd = run_session(env, cwd, "ctrlc-edit", [
+            (3.0, None),
+            (1.0, b"e"),
+            (0.5, marker4.encode()),
+            (0.3, b"\x03"),          # Ctrl-C inside the editor
+            (SAVE_POLL_SECS, None),
+        ], kill=False)
+        ok4 = marker4 in open(note).read() and alive(pid)
+        print(f"[ctrl-c edit] saved and app still running: {ok4}")
+        kill_session(pid, fd)
+        results["ctrl-c-in-edit-saves"] = ok4
+
+        # 5: Ctrl-C OUTSIDE edit mode quits immediately (panic hatch).
+        out5, pid, fd = run_session(env, cwd, "ctrlc-quit", [
+            (3.0, None),
+            (1.0, b"\x03"),          # Ctrl-C on the list view
+            (1.5, None),
+        ], kill=False)
+        quit_ok = not alive(pid)
+        print(f"[ctrl-c list] app quit immediately: {quit_ok}")
+        kill_session(pid, fd)
+        results["ctrl-c-quit-hatch"] = quit_ok
+
+    # --- Verdict -------------------------------------------------------------
+    failed = [k for k, v in results.items() if not v]
+    if not failed:
+        print(f"PASS: all {len(results)} scenarios verified on the real binary")
         return 0
-    if not before_esc:
-        fail("autosave did not write before Esc (check debounce/status bar)")
-    fail("Esc-save did not write (check open note resolution)")
+    fail(f"failed scenarios: {', '.join(failed)}")
 
 
 if __name__ == "__main__":
