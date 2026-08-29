@@ -350,7 +350,7 @@ pub fn list_collections() -> Result<Vec<(String, PathBuf)>, String> {
 /// Create a new note file inside `collection_dir`, then reindex just that file so
 /// it appears in search immediately. Returns the absolute path written.
 pub fn create_note(
-    collection_dir: &PathBuf,
+    collection_dir: &Path,
     file_name: &str,
     content: &str,
 ) -> Result<PathBuf, String> {

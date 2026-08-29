@@ -577,7 +577,7 @@ impl App {
                 }
                 self.reload_notes();
                 // Keep the renamed note selected in the list if still present.
-                if let Some(idx) = self.notes.iter().position(|n| &n.file == &raw) {
+                if let Some(idx) = self.notes.iter().position(|n| n.file == raw) {
                     self.list_state.select(Some(idx));
                 }
             }
@@ -760,7 +760,7 @@ impl App {
             // SIGINT), so unlike Esc it cannot be consumed by the terminal/SSH
             // layer. It saves first, so work is never lost.
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                let _ = self.save_edit();
+                self.save_edit();
                 self.edit_mode = false;
                 return false;
             }
@@ -771,7 +771,7 @@ impl App {
                 // is not delivered by the terminal/SSH layer, Ctrl-C also saves
                 // & exits (it is always delivered in raw mode).
                 KeyCode::Esc => {
-                    let _ = self.save_edit();
+                    self.save_edit();
                     self.edit_mode = false;
                 }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -783,11 +783,11 @@ impl App {
                 // the CONTROL modifier, so accept both forms. It always exits
                 // edit mode so the user is never trapped, even if save fails.
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = self.save_edit();
+                    self.save_edit();
                     self.edit_mode = false;
                 }
                 KeyCode::Char('\u{18}') => {
-                    let _ = self.save_edit();
+                    self.save_edit();
                     self.edit_mode = false;
                 }
                 // Alt-S (Meta+S) and F2 are flow-control-safe alternatives to
@@ -800,7 +800,7 @@ impl App {
                 // not subject to flow control, giving another way out when
                 // Ctrl-X does not reach the TUI on a given terminal.
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    let _ = self.save_edit();
+                    self.save_edit();
                     self.edit_mode = false;
                 }
                 KeyCode::F(2) => self.save_edit(),
