@@ -14,7 +14,7 @@
 //!   Enter          preview the selected note (hover already previews as you move)
 //!   c              switch collection (filter the list/notes)
 //!   ?              show keybindings
-//!   n              create a new note (enter "<collection>/<file>.md")
+//!   n / +          create a new note (enter "<collection>/<file>.md")
 //!   r              rename / move the selected note ("<collection>/<file>.md")
 //!   y              duplicate the selected note into a copy (same collection)
 //!   e              edit the open note inline (tui-textarea)
@@ -754,6 +754,7 @@ impl App {
             KeyCode::Char('y') => self.duplicate_selected(),
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('n') => self.start_create(),
+            KeyCode::Char('+') => self.start_create(),
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => self.start_rename(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => self.save_edit(),
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -965,7 +966,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("Enter", "preview the selected note (hover already previews as you move)"),
     ("↑ ↓ / j k", "move through the note list; the body previews as you go (g top · G bottom)"),
     ("c", "switch collection (filter list + search)"),
-    ("n", "create a new note"),
+    ("n / +", "create a new note (enter \"<collection>/<file>.md\")"),
     ("r", "rename / move the selected note (cross-collection)"),
     ("y", "duplicate the selected note into a copy (same collection)"),
     ("e", "edit the open note inline"),
@@ -1048,8 +1049,11 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Span::styled("_", Style::default().fg(Color::Magenta)),
         ])
     } else {
+        // Idle (no active prompt): show a persistent key hint so the main
+        // actions are discoverable — there is no on-screen button in a TUI, so
+        // the hint acts as the "new note" affordance (+/n, etc.).
         Line::from(vec![Span::styled(
-            "press / to search",
+            "n/+ new  y dup  r rename  d del  e edit  / search  ? help",
             Style::default().fg(Color::DarkGray),
         )])
     };
@@ -1790,6 +1794,20 @@ mod app_tests {
         app.handle_key(key('n'));
         assert!(!app.show_help, "help closed on keypress");
         assert!(!app.creating, "create prompt not triggered while help was open");
+    }
+
+    // '+' (as an alternative to 'n') opens the new-note prompt via the real key
+    // path. Skips without a usable collection.
+    #[test]
+    fn plus_key_starts_create() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        if app.notes.is_empty() {
+            return; // no collection/indexed notes -> start_create is a no-op
+        }
+        assert!(!app.creating, "not creating before '+'");
+        app.handle_key(key('+'));
+        assert!(app.creating, "new-note prompt opens on '+'");
     }
 
     // 'd' arms a mandatory delete confirmation; only Enter deletes, and any

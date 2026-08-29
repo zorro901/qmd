@@ -90,7 +90,7 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | `↑` / `↓` or `j` / `k` | Move through the note list; the body previews as you go (`g` top, `G` bottom) |
 | `Enter` | Preview the selected note (hover already previews as you move) |
 | `c` | Switch collection (filters the list and search) |
-| `n` | Create a new note |
+| `n` / `+` | Create a new note |
 | `r` | Rename / move the selected note (cross-collection) |
 | `y` | Duplicate the selected note into a copy (same collection) |
 | `e` | Edit the open note inline (tui-textarea) |
