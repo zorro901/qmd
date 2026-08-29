@@ -97,6 +97,7 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | `d` | Delete the selected note (asks to confirm) |
 | `Ctrl-S` / `Alt-S` / `F2` | Save the inline edit (write file + reindex) |
 | `Ctrl-X` / `Alt-X` | Save + exit inline edit (flow-control-safe) |
+| (automatic) | While editing, changes autosave ~2s after you stop typing |
 | `PgUp` / `PgDn`, `Home` / `End`, mouse wheel | Scroll the note body |
 | click a list row | Select (and preview) that note |
 | `Ctrl-R` | Reload the note list |

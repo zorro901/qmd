@@ -33,6 +33,7 @@
 mod qmd;
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
@@ -64,6 +65,11 @@ enum Confirm {
     Quit,
     Delete,
 }
+
+/// While editing, wait this long after the last keystroke before autosaving, so
+/// we debounce rapid typing into occasional `qmd update` writes instead of one
+/// per character.
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 struct App {
     notes: Vec<qmd::Note>,
@@ -111,6 +117,9 @@ struct App {
     /// Screen rectangle of the note list, refreshed each draw, so mouse clicks
     /// can be mapped to a list row for click-to-select.
     list_area: Rect,
+    /// Instant of the last keystroke while editing; used to debounce autosave so
+    /// we don't shell out to qmd on every single character.
+    last_edit: Option<Instant>,
 }
 
 impl App {
@@ -143,6 +152,7 @@ impl App {
             debug_keys: false,
             last_key: String::new(),
             list_area: Rect::ZERO,
+            last_edit: None,
         };
         app.reload_notes();
         // Open the first note so the right pane is populated immediately
@@ -590,6 +600,7 @@ impl App {
                 self.open_body = content;
                 self.dirty = false;
                 self.edit_mode = false;
+                self.last_edit = None;
                 self.status = "saved & reindexed".into();
                 // Refresh the list so a freshly created/edited note shows up
                 // (and the title reflects the new file) without a manual reload.
@@ -602,6 +613,49 @@ impl App {
                 }
             }
             Err(e) => self.status = format!("save error: {e}"),
+        }
+    }
+
+    /// Write the current editor contents to disk via qmd (without leaving edit
+    /// mode). Used by the debounced autosave so the user is never left with
+    /// unsaved work if they walk away mid-edit. On success clears `dirty` and
+    /// refreshes the list in place; on failure surfaces the error in the status
+    /// bar but keeps editing so nothing is lost.
+    fn autosave_now(&mut self) {
+        let abs = match &self.open_abs {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let content: String = self.textarea.lines().join("\n");
+        match qmd::save(&abs, &content) {
+            Ok(()) => {
+                self.open_body = content;
+                self.dirty = false;
+                self.status = "autosaved".into();
+                // Refresh the list (title/order) in place; do NOT touch the
+                // textarea or leave edit mode, so the cursor never jumps.
+                self.reload_notes();
+                if let Some(open) = &self.open_file {
+                    if let Some(idx) = self.notes.iter().position(|n| &n.file == open) {
+                        self.list_state.select(Some(idx));
+                    }
+                }
+            }
+            Err(e) => self.status = format!("autosave error: {e}"),
+        }
+    }
+
+    /// Debounced autosave: while editing and dirty, persist once enough time has
+    /// elapsed since the last keystroke. Called from the event loop each tick.
+    fn maybe_autosave(&mut self) {
+        if !self.edit_mode || !self.dirty {
+            return;
+        }
+        if let Some(t) = self.last_edit {
+            if t.elapsed() >= AUTOSAVE_DEBOUNCE {
+                self.last_edit = None;
+                self.autosave_now();
+            }
         }
     }
 
@@ -714,6 +768,7 @@ impl App {
                 _ => {
                     self.textarea.input(Input::from(key));
                     self.dirty = true;
+                    self.last_edit = Some(Instant::now());
                 }
             }
             return false;
@@ -924,6 +979,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 _ => {}
             }
         }
+        // Debounced autosave tick: persist edits ~2s after the last keystroke so
+        // the user never loses work even if they forget to save before leaving.
+        app.maybe_autosave();
     }
     Ok(())
 }
@@ -1116,7 +1174,7 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         ])
     } else if app.edit_mode {
         Line::from(vec![Span::styled(
-            "editing — Esc saves & exits · Ctrl-C quit",
+            "editing — autosaves · Esc saves & exits · Ctrl-C quit",
             Style::default().fg(Color::Green),
         )])
     } else if app.creating {
@@ -2222,6 +2280,76 @@ mod app_tests {
             Err(_) => false,
         };
         assert!(!listed, "note removed from the qmd index");
+    }
+
+    // Debounced autosave: when editing and dirty past the debounce window,
+    // maybe_autosave persists via qmd, clears dirty, and stays in edit mode.
+    #[test]
+    fn autosave_persists_after_debounce() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-auto-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        assert!(app.edit_mode);
+
+        for c in "autosaved text".chars() {
+            app.handle_key(key(c));
+        }
+        assert!(app.dirty, "typing marks dirty");
+
+        // Pretend the last keystroke was well past the debounce window.
+        app.last_edit = Some(Instant::now() - Duration::from_secs(10));
+        app.maybe_autosave();
+
+        assert!(!app.dirty, "autosave clears dirty");
+        assert!(app.edit_mode, "autosave stays in edit mode");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(
+            content.contains("autosaved text"),
+            "autosave wrote the file; got: {content:?}"
+        );
+        assert!(app.last_edit.is_none(), "debounce timer reset after autosave");
+
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
+    }
+
+    // maybe_autosave is a no-op while actively typing (debounce not elapsed).
+    #[test]
+    fn autosave_suppressed_before_debounce() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-auto2-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        for c in "not yet".chars() {
+            app.handle_key(key(c));
+        }
+        // No timer armed yet (marker set at the poll boundary), so autosave
+        // must not fire and must not clear dirty.
+        app.last_edit = None;
+        app.maybe_autosave();
+        assert!(app.dirty, "no autosave before any debounce window");
+        let abs = app.open_abs.clone().unwrap();
+        let _ = std::fs::remove_file(&abs);
     }
 }
 
