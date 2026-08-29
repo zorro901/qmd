@@ -104,8 +104,27 @@ pub fn search(query: &str, collection: Option<&str>) -> Result<Vec<Note>, String
         .collect())
 }
 
+/// Resolve a possibly-relative note path returned by `qmd multi-get --full-path`
+/// to an absolute on-disk path. `qmd` emits a *relative* path (e.g.
+/// `"./notes/alpha.md"`) even with `--full-path`, so we map the leading
+/// collection segment onto the directory from `qmd collection list`. Absolute
+/// paths (rare) pass through unchanged. Returns None only if the collection
+/// cannot be located, which would also block saving/deleting.
+fn resolve_abs(rel: &str) -> Option<PathBuf> {
+    let cleaned = rel.strip_prefix("./").unwrap_or(rel);
+    let (coll_name, rest) = cleaned.split_once('/')?;
+    let collections = list_collections().ok()?;
+    let dir = collections
+        .into_iter()
+        .find(|(n, _)| n == coll_name)
+        .map(|(_, p)| p)?;
+    Some(dir.join(rest))
+}
+
 /// Fetch a note's body. Uses `qmd multi-get --full-path` so the `file`
-/// field carries the on-disk absolute path (needed for saving + deleting).
+/// field carries the on-disk path (needed for saving + deleting). `qmd` emits
+/// a *relative* path even with `--full-path`, so we resolve it to absolute via
+/// the collection list (see `resolve_abs`).
 pub fn get_body(file: &str) -> Result<(String, Option<PathBuf>), String> {
     let raw = run_qmd(&[
         "multi-get",
@@ -121,11 +140,11 @@ pub fn get_body(file: &str) -> Result<(String, Option<PathBuf>), String> {
         .into_iter()
         .next()
         .ok_or_else(|| format!("note not found: {file}"))?;
-    // With --full-path the `file` field is the absolute on-disk path.
+    // `--full-path` is relative here (e.g. "./notes/alpha.md"), so resolve it.
     let abs = if first.file.starts_with('/') {
         Some(PathBuf::from(&first.file))
     } else {
-        None
+        resolve_abs(&first.file)
     };
     Ok((first.body, abs))
 }
@@ -362,6 +381,27 @@ mod tests {
         // Reindex the (now-removed) file so the index stays consistent.
         let _ = save(&abs, "");
         assert!(listed, "newly created note should appear in qmd notes");
+    }
+
+    // get_body resolves the on-disk absolute path even though `qmd multi-get
+    // --full-path` emits a *relative* path (e.g. "./coll/a.md"). Saving and
+    // deleting both depend on this. Skips if no indexed note is available.
+    #[test]
+    fn get_body_resolves_absolute_path() {
+        let notes = match list_notes(None) {
+            Ok(v) if !v.is_empty() => v,
+            _ => return, // nothing indexed to test against
+        };
+        let id = &notes[0].file;
+        let (body, abs) = match get_body(id) {
+            Ok(t) => t,
+            Err(_) => return, // can't resolve without a usable index
+        };
+        assert!(body.contains(" ") || !body.is_empty(), "body fetched");
+        assert!(abs.is_some(), "absolute path resolved from qmd");
+        let abs = abs.unwrap();
+        assert!(abs.is_absolute(), "resolved path must be absolute: {abs:?}");
+        assert!(abs.exists(), "resolved path points at a real file: {abs:?}");
     }
 
     // NotesJson parses the mtime field, which the TUI renders as a recency

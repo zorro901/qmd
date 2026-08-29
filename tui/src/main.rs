@@ -434,7 +434,7 @@ impl App {
         self.textarea = TextArea::from(self.open_body.split('\n'));
         self.edit_mode = true;
         self.vertical_scroll = 0;
-        self.status = "editing — Ctrl-S save · Esc cancel".into();
+        self.status = "editing — autosaves · Esc saves & exits · Ctrl-C quit".into();
     }
 
     /// Scroll the note body by `delta` lines (negative = up), clamped to the
@@ -632,8 +632,6 @@ impl App {
                 self.open_body = content;
                 self.dirty = false;
                 self.status = "autosaved".into();
-                // Refresh the list (title/order) in place; do NOT touch the
-                // textarea or leave edit mode, so the cursor never jumps.
                 self.reload_notes();
                 if let Some(open) = &self.open_file {
                     if let Some(idx) = self.notes.iter().position(|n| &n.file == open) {
