@@ -107,27 +107,61 @@ pub fn search(query: &str, collection: Option<&str>) -> Result<Vec<Note>, String
 /// Resolve a possibly-relative note path returned by `qmd multi-get --full-path`
 /// to an absolute on-disk path.
 ///
-/// IMPORTANT: `qmd multi-get --full-path` does NOT return the collection name in
-/// the path. It returns the on-disk relative path, e.g. `"./notes/n3.md"`, where
-/// the leading `notes` segment is the *directory name* of the collection's path
-/// (e.g. collection `t` is rooted at `/tmp/qmdnt/notes`), not the collection id.
-/// So we strip the `./`, take the first path segment, and match it against the
-/// *final segment of each collection's path* (not the collection name), then join
-/// the remainder. Absolute paths (rare) pass through unchanged. Returns None only
-/// if no collection directory matches (which would also block saving/deleting).
+/// The `./`-prefixed form (e.g. `"./notes/n3.md"`) is emitted by qmd ONLY when
+/// the file lies under the CWD of the qmd child process, and `run_qmd` inherits
+/// the TUI's cwd. So the correct resolution is against `std::env::current_dir()`,
+/// NOT against collection names or directory names. (Collection names never
+/// appear in this form; e.g. collection `t` rooted at `/tmp/qmdnt/notes` yields
+/// `./notes/...`, where `notes` is just a directory segment.)
+///
+/// Other accepted forms: an absolute path (pass-through), and as a last resort a
+/// `"collection/path"` (or `qmd://collection/path`) id mapped via
+/// `qmd collection list` — first by collection NAME, then by the collection
+/// path's final directory segment. Returns None only if nothing matches, which
+/// blocks saving/deleting with a loud status instead of a silent no-op.
 fn resolve_abs(rel: &str) -> Option<PathBuf> {
-    let cleaned = rel.strip_prefix("./").unwrap_or(rel);
-    // Already absolute: keep as-is.
-    if cleaned.starts_with('/') {
-        return Some(PathBuf::from(cleaned));
+    match resolve_abs_with(rel, std::env::current_dir().ok().as_deref()) {
+        Some(p) => Some(p),
+        // The collection fallback needs `qmd collection list`; only reach for
+        // the CLI when the pure rules could not resolve the path.
+        None => {
+            let collections = list_collections().ok()?;
+            resolve_abs_with_collections(rel, &collections)
+        }
     }
-    let (dir_seg, rest) = cleaned.split_once('/')?;
-    let collections = list_collections().ok()?;
-    let dir = collections
-        .into_iter()
-        .find(|(_, p)| p.file_name().map(|n| n == dir_seg).unwrap_or(false))
-        .map(|(_, p)| p)?;
-    Some(dir.join(rest))
+}
+
+/// Pure part of `resolve_abs`: everything decidable without invoking qmd.
+/// `cwd` is optional so tests can simulate a missing cwd.
+fn resolve_abs_with(rel: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+    // Absolute path: pass through unchanged.
+    if rel.starts_with('/') {
+        return Some(PathBuf::from(rel));
+    }
+    // "./..." form: relative to the TUI's cwd (== qmd child's cwd).
+    if let Some(cleaned) = rel.strip_prefix("./") {
+        if cleaned.is_empty() {
+            return None;
+        }
+        let cwd = cwd?;
+        return Some(cwd.join(cleaned));
+    }
+    None
+}
+
+/// Collection-based fallback for bare "<collection>/<path>" ids (possibly
+/// qmd://-prefixed): first by collection NAME, then by the collection path's
+/// final directory segment.
+fn resolve_abs_with_collections(rel: &str, collections: &[(String, PathBuf)]) -> Option<PathBuf> {
+    let cleaned = rel.strip_prefix("qmd://").unwrap_or(rel);
+    let (first, rest) = cleaned.split_once('/')?;
+    if let Some((_, p)) = collections.iter().find(|(n, _)| n == first) {
+        return Some(p.join(rest));
+    }
+    collections
+        .iter()
+        .find(|(_, p)| p.file_name().map(|n| n == first).unwrap_or(false))
+        .map(|(_, p)| p.join(rest))
 }
 
 /// Fetch a note's body. Uses `qmd multi-get --full-path` so the `file`
@@ -331,6 +365,15 @@ pub fn create_note(
 }
 
 
+/// Serializes all qmd-touching tests crate-wide (qmd.rs and main.rs): they share
+/// one index and the same first-listed note, so parallel runs race on
+/// truncate-write + reindex and read empty files spuriously.
+#[cfg(test)]
+pub(crate) fn qmd_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +383,7 @@ mod tests {
     // or no index exists (CI without a built index).
     #[test]
     fn save_then_relist_reflects_content() {
+        let _guard = qmd_test_lock();
         // Point at an existing indexed file when provided (e.g. a qmd collection
         // under test), otherwise use a temp file that qmd won't index (the test
         // then self-skips via the early return below).
@@ -372,6 +416,7 @@ mod tests {
     // list. Skips if no indexed collection dir is supplied via QMD_TUI_TEST_COLL_DIR.
     #[test]
     fn create_note_shows_in_list() {
+        let _guard = qmd_test_lock();
         let dir: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
             Ok(d) => d.into(),
             Err(_) => return, // nothing indexed to test against
@@ -397,6 +442,7 @@ mod tests {
     // deleting both depend on this. Skips if no indexed note is available.
     #[test]
     fn get_body_resolves_absolute_path() {
+        let _guard = qmd_test_lock();
         let notes = match list_notes(None) {
             Ok(v) if !v.is_empty() => v,
             _ => return, // nothing indexed to test against
@@ -463,6 +509,7 @@ mod tests {
     // is silently lost.
     #[test]
     fn existing_note_save_roundtrip() {
+        let _guard = qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let notes = match list_notes(None) {
             Ok(n) if !n.is_empty() => n,
@@ -488,5 +535,69 @@ mod tests {
         );
         // Restore the original content so the test leaves no junk behind.
         let _ = save(&abs, &before);
+    }
+
+    // "./..."-form paths from `multi-get --full-path` are relative to the qmd
+    // child's cwd (== the TUI's cwd), so they must join with cwd — never with a
+    // collection root and never be treated as a collection name.
+    #[test]
+    fn resolve_abs_joins_dot_relative_with_cwd() {
+        let cwd = Path::new("/base/dir");
+        assert_eq!(
+            resolve_abs_with("./notes/n3.md", Some(cwd)),
+            Some(PathBuf::from("/base/dir/notes/n3.md"))
+        );
+        // A path that merely *looks* like "collection/file" is not resolvable
+        // by the pure rules; the cwd form is what multi-get actually emits.
+        assert_eq!(resolve_abs_with("./notes/n3.md", None), None);
+        assert_eq!(resolve_abs_with("./", Some(cwd)), None);
+    }
+
+    // Absolute paths pass through untouched (qmd emits these when the note is
+    // not under the qmd child's cwd).
+    #[test]
+    fn resolve_abs_passes_absolute_through() {
+        assert_eq!(
+            resolve_abs_with("/home/wave/notes/x.md", None),
+            Some(PathBuf::from("/home/wave/notes/x.md"))
+        );
+        assert_eq!(
+            resolve_abs_with("/tmp/qmdnt/notes/n3.md", Some(Path::new("/elsewhere"))),
+            Some(PathBuf::from("/tmp/qmdnt/notes/n3.md"))
+        );
+    }
+
+    // Bare "<collection>/<path>" ids fall back to collection lookup: by name
+    // first, then by the collection dir's final segment. Covers qmd:// too.
+    #[test]
+    fn resolve_abs_collection_fallback() {
+        let colls = vec![
+            ("t".to_string(), PathBuf::from("/tmp/qmdnt/notes")),
+            ("0".to_string(), PathBuf::from("/tmp/qmdrepro/notes")),
+        ];
+        // By collection name.
+        assert_eq!(
+            resolve_abs_with_collections("t/n3.md", &colls),
+            Some(PathBuf::from("/tmp/qmdnt/notes/n3.md"))
+        );
+        // By final directory segment when the name does not match. Both
+        // collections end in "notes/", so FIRST match wins; assert the id maps
+        // to ONE of them (the tie is broken by list order, not by the path).
+        let got = resolve_abs_with_collections("notes/beta.md", &colls).expect("dir segment match");
+        let expected = [
+            PathBuf::from("/tmp/qmdnt/notes/beta.md"),
+            PathBuf::from("/tmp/qmdrepro/notes/beta.md"),
+        ];
+        assert!(
+            expected.contains(&got),
+            "dir-segment match must land on a notes/ collection, got {got:?}"
+        );
+        // qmd:// prefix is accepted on the fallback form.
+        assert_eq!(
+            resolve_abs_with_collections("qmd://t/n3.md", &colls),
+            Some(PathBuf::from("/tmp/qmdnt/notes/n3.md"))
+        );
+        // No match anywhere -> None (callers must surface this, not save silently).
+        assert_eq!(resolve_abs_with_collections("x/y.md", &colls), None);
     }
 }

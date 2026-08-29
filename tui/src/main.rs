@@ -635,9 +635,25 @@ impl App {
     /// refreshes the list in place; on failure surfaces the error in the status
     /// bar but keeps editing so nothing is lost.
     fn autosave_now(&mut self) {
+        // Same resolution as save_edit: prefer the cached open_abs, else derive
+        // it from open_file. Autosave must never silently no-op just because
+        // preview didn't cache a path — a silent drop here is exactly the
+        // "autosave never happens" failure mode.
         let abs = match &self.open_abs {
             Some(p) => p.clone(),
-            None => return,
+            None => match &self.open_file {
+                Some(f) => match qmd::get_body(f) {
+                    Ok((_, Some(a))) => {
+                        self.open_abs = Some(a.clone());
+                        a
+                    }
+                    _ => {
+                        self.status = "autosave skipped: cannot resolve note path".into();
+                        return;
+                    }
+                },
+                None => return, // nothing open — nothing to autosave
+            },
         };
         let content: String = self.textarea.lines().join("\n");
         match qmd::save(&abs, &content) {
@@ -1365,6 +1381,7 @@ mod app_tests {
     // usable indexed collection (QMD_TUI_TEST_COLL_DIR + working qmd index).
     #[test]
     fn create_then_save_roundtrip() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let name = format!("qmd-tui-it-{}.md", std::process::id());
         let mut app = App::new();
@@ -1404,6 +1421,7 @@ mod app_tests {
     // the old id in the qmd index. Skips without a usable indexed collection.
     #[test]
     fn rename_moves_note_in_index() {
+        let _guard = qmd::qmd_test_lock();
         let dir: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
             Ok(d) => d.into(),
             Err(_) => return,
@@ -1470,6 +1488,7 @@ mod app_tests {
     // id. Skips without a usable indexed collection.
     #[test]
     fn duplicate_creates_copy_in_index() {
+        let _guard = qmd::qmd_test_lock();
         let dir: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
             Ok(d) => d.into(),
             Err(_) => return,
@@ -1531,6 +1550,7 @@ mod app_tests {
     // not snap back to the top. Skips without a usable indexed collection.
     #[test]
     fn reload_keeps_selected_note() {
+        let _guard = qmd::qmd_test_lock();
         let dir: std::path::PathBuf = match std::env::var("QMD_TUI_TEST_COLL_DIR") {
             Ok(d) => d.into(),
             Err(_) => return,
@@ -1562,6 +1582,7 @@ mod app_tests {
     // current selection and never diverges. Skips without a usable collection.
     #[test]
     fn enter_preview_matches_selection() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         if app.notes.len() < 2 {
@@ -1675,6 +1696,7 @@ mod app_tests {
     // right pane is populated without an explicit Enter (SimpleNote style).
     #[test]
     fn app_new_previews_first_note() {
+        let _guard = qmd::qmd_test_lock();
         let app = App::new();
         if app.notes.is_empty() {
             return; // no index to preview against in this environment
@@ -1710,6 +1732,7 @@ mod app_tests {
     // even if Esc is not delivered by the terminal. The most reliable escape hatch.
     #[test]
     fn ctrl_c_while_editing_saves_and_exits() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
@@ -1751,6 +1774,7 @@ mod app_tests {
     // qmd::get_body + resolve_abs. Regression guard for "Esc returns without saving".
     #[test]
     fn esc_on_existing_note_saves() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         // No notes means the index isn't set up for the test; skip gracefully.
@@ -1787,6 +1811,7 @@ mod app_tests {
     // (never trapping the user behind a prompt), with no confirm arm.
     #[test]
     fn esc_while_editing_saves_and_exits() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
@@ -1822,6 +1847,7 @@ mod app_tests {
     // list is refreshed so the new note appears. Needs a usable index.
     #[test]
     fn keypress_edit_then_save_persists() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         // Create a note, then exercise the key-driven editor on it.
@@ -1880,6 +1906,7 @@ mod app_tests {
     // Ctrl-S can be eaten before it reaches the TUI. Needs a usable index.
     #[test]
     fn alt_s_and_f2_save_in_edit_mode() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
@@ -1932,6 +1959,7 @@ mod app_tests {
     // Ctrl-S is eaten). Needs a usable index.
     #[test]
     fn ctrl_x_saves_and_exits_edit_mode() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
@@ -1968,6 +1996,7 @@ mod app_tests {
     // Char('x') with the CONTROL modifier. Either form must save + exit.
     #[test]
     fn ctrl_x_can_code_saves_and_exits() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
@@ -2003,6 +2032,7 @@ mod app_tests {
     // Alt-X (Meta+X) also saves + exits edit mode.
     #[test]
     fn alt_x_saves_and_exits_edit_mode() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
@@ -2038,6 +2068,7 @@ mod app_tests {
     // (where 'q' is shadowed by the textarea). handle_key returns true.
     #[test]
     fn ctrl_c_quits_from_edit_mode() {
+        let _guard = qmd::qmd_test_lock();
         let mut app = App::new();
         app.start_create();
         if !app.creating {
@@ -2407,6 +2438,7 @@ mod app_tests {
     // maybe_autosave persists via qmd, clears dirty, and stays in edit mode.
     #[test]
     fn autosave_persists_after_debounce() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
@@ -2448,6 +2480,7 @@ mod app_tests {
     // maybe_autosave is a no-op while actively typing (debounce not elapsed).
     #[test]
     fn autosave_suppressed_before_debounce() {
+        let _guard = qmd::qmd_test_lock();
         let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
         app.start_create();
