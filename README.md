@@ -109,6 +109,26 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 Search matches are highlighted in the list and in the open note (bold yellow),
 and the active collection shows in the list title.
 
+**Testing**
+
+Unit tests drive the `App` struct headlessly (no terminal needed):
+
+```sh
+cd tui && cargo test
+```
+
+The end-to-end acceptance path is covered by a real-PTY harness that launches
+the actual `qmd-tui` binary, sends real keystrokes (`e`, typing, `Esc`, `q`),
+and verifies edits land on disk — once via the autosave debounce (no save key
+pressed) and once via `Esc` on an existing note:
+
+```sh
+cd tui && QMD_BIN=/path/to/qmd python3 scripts/pty_acceptance.py
+```
+
+It uses a throwaway index under `/tmp` by default; see the script header for
+env overrides (`QMD_TUI_BIN`, `QMD_ACC_COLL_DIR`, …).
+
 ### Using with AI Agents
 
 QMD's `--json` and `--files` output formats are designed for agentic workflows:
