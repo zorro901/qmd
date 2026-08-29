@@ -103,6 +103,12 @@ struct App {
     picking: bool,
     /// When true, the keybinding help overlay is shown (dismissed by any key).
     show_help: bool,
+    /// When true (toggled with F12), the last raw key event is echoed to the
+    /// status bar. Used to diagnose which key codes actually reach the TUI on a
+    /// given terminal/SSH setup (e.g. when Ctrl-X or Alt-X appear to do nothing).
+    debug_keys: bool,
+    /// Last raw key event string, shown when `debug_keys` is on.
+    last_key: String,
     /// Screen rectangle of the note list, refreshed each draw, so mouse clicks
     /// can be mapped to a list row for click-to-select.
     list_area: Rect,
@@ -135,6 +141,8 @@ impl App {
             collection_idx: 0,
             picking: false,
             show_help: false,
+            debug_keys: false,
+            last_key: String::new(),
             list_area: Rect::ZERO,
         };
         app.reload_notes();
@@ -614,6 +622,22 @@ impl App {
     /// Handle a key event. Returns true when the app should quit. Centralized
     /// here so the logic is unit-testable without a terminal.
     fn handle_key(&mut self, key: event::KeyEvent) -> bool {
+        // Debug echo: remember the raw event so F12 can surface it on the
+        // status bar. This is how we learn which key codes actually reach the
+        // TUI on a given terminal (e.g. when Ctrl-X / Alt-X seem dead).
+        self.last_key = format!("{:?}", key);
+
+        // F12 toggles the key debug echo (no other binding uses F12).
+        if key.code == KeyCode::F(12) {
+            self.debug_keys = !self.debug_keys;
+            self.status = if self.debug_keys {
+                "key debug on — last key shown in status".into()
+            } else {
+                "key debug off".into()
+            };
+            return false;
+        }
+
         // A confirmation prompt is active: Enter confirms, everything else
         // (including the same key that triggered it) cancels.
         if let Some(confirm) = self.confirm_pending {
@@ -1158,6 +1182,11 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         })
         .collect();
 
+    let status = if app.debug_keys {
+        format!("{}  | last key: {}", app.status, app.last_key)
+    } else {
+        app.status.clone()
+    };
     let list = List::new(items)
         .block(
             Block::default()
@@ -1166,7 +1195,7 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                     "qmd  [{}]  [{}]  {}",
                     search_line,
                     app.collection.as_deref().unwrap_or("all"),
-                    app.status
+                    status
                 )),
         )
         .highlight_style(
@@ -1856,6 +1885,20 @@ mod app_tests {
         ));
         assert!(quit, "Ctrl-C should request quit");
         assert!(!app.edit_mode, "Ctrl-C drops out of edit mode");
+    }
+
+    // F12 toggles the key-debug echo and the last raw key is recorded. Used to
+    // diagnose which key codes reach the TUI on a given terminal.
+    #[test]
+    fn f12_toggles_key_debug() {
+        let mut app = App::new();
+        assert!(!app.debug_keys, "debug off initially");
+        app.handle_key(event::KeyEvent::new(KeyCode::F(12), KeyModifiers::empty()));
+        assert!(app.debug_keys, "F12 turns debug on");
+        app.handle_key(key('x'));
+        assert!(app.last_key.contains("Char('x')"), "last key recorded: {}", app.last_key);
+        app.handle_key(event::KeyEvent::new(KeyCode::F(12), KeyModifiers::empty()));
+        assert!(!app.debug_keys, "F12 turns debug off");
     }
 
     // Body scroll clamps: never negative, never past the last visible line for a
