@@ -22,7 +22,7 @@
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
 //!   Esc            leave search · discard inline edit (asks if unsaved) · quit prompt
 //!   Ctrl-S / Alt-S / F2   save the inline edit (write file + reindex)
-//!   Ctrl-X             save + exit inline edit (flow-control-safe)
+//!   Ctrl-X / Alt-X    save + exit inline edit (flow-control-safe)
 //!   Ctrl-C             quit immediately from anywhere (panic hatch)
 //!   Ctrl-R         reload the note list
 //!   q              quit (asks if there are unsaved changes)
@@ -668,10 +668,15 @@ impl App {
                     self.save_edit()
                 }
                 // Ctrl-X saves and leaves edit mode (flow-control-safe: unlike
-                // Ctrl-S it is never eaten by XOFF). This is the reliable way to
-                // finish editing when Ctrl-S does not reach the TUI; it always
-                // exits edit mode so the user is never trapped, even if save fails.
+                // Ctrl-S it is never eaten by XOFF). Some terminals deliver
+                // Ctrl-X as the raw 0x18 (CAN) code rather than Char('x') with
+                // the CONTROL modifier, so accept both forms. It always exits
+                // edit mode so the user is never trapped, even if save fails.
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = self.save_edit();
+                    self.edit_mode = false;
+                }
+                KeyCode::Char('\u{18}') => {
                     let _ = self.save_edit();
                     self.edit_mode = false;
                 }
@@ -680,6 +685,13 @@ impl App {
                 // before it reaches the TUI, so saving would silently fail.
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.save_edit()
+                }
+                // Alt-X (Meta+X) also saves + exits edit mode. Like Alt-S it is
+                // not subject to flow control, giving another way out when
+                // Ctrl-X does not reach the TUI on a given terminal.
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    let _ = self.save_edit();
+                    self.edit_mode = false;
                 }
                 KeyCode::F(2) => self.save_edit(),
                 _ => {
@@ -1020,7 +1032,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("e", "edit the open note inline"),
     ("d", "delete the selected note (asks)"),
     ("Ctrl-S / Alt-S / F2", "save the inline edit (write + reindex)"),
-    ("Ctrl-X", "save + exit inline edit (flow-control-safe)"),
+    ("Ctrl-X / Alt-X", "save + exit inline edit (flow-control-safe)"),
     ("Ctrl-C", "quit immediately from anywhere"),
     ("PgUp/PgDn", "scroll the note body"),
     ("Home/End", "jump to top / bottom of body"),
@@ -1751,6 +1763,76 @@ mod app_tests {
         let abs = app.open_abs.clone().unwrap();
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
         assert!(content.contains("saved via ctrl-x"), "Ctrl-X wrote the file; got: {content:?}");
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
+    }
+
+    // Some terminals deliver Ctrl-X as the raw 0x18 (CAN) code instead of
+    // Char('x') with the CONTROL modifier. Either form must save + exit.
+    #[test]
+    fn ctrl_x_can_code_saves_and_exits() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-ctrlx2-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        if !app.edit_mode {
+            return;
+        }
+        for c in "via 0x18".chars() {
+            app.handle_key(key(c));
+        }
+        // Raw CAN byte (what some terminals send for Ctrl-X).
+        app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('\u{18}'),
+            KeyModifiers::empty(),
+        ));
+        assert!(!app.edit_mode, "0x18 exits edit mode");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(content.contains("via 0x18"), "0x18 wrote the file; got: {content:?}");
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
+    }
+
+    // Alt-X (Meta+X) also saves + exits edit mode.
+    #[test]
+    fn alt_x_saves_and_exits_edit_mode() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-altx-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        if !app.edit_mode {
+            return;
+        }
+        for c in "via alt-x".chars() {
+            app.handle_key(key(c));
+        }
+        app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::ALT,
+        ));
+        assert!(!app.edit_mode, "Alt-X exits edit mode");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(content.contains("via alt-x"), "Alt-X wrote the file; got: {content:?}");
         let _ = std::fs::remove_file(&abs);
         let _ = qmd::save(&abs, "");
     }
