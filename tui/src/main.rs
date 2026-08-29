@@ -22,6 +22,8 @@
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
 //!   Esc            leave search · discard inline edit (asks if unsaved) · quit prompt
 //!   Ctrl-S / Alt-S / F2   save the inline edit (write file + reindex)
+//!   Ctrl-X             save + exit inline edit (flow-control-safe)
+//!   Ctrl-C             quit immediately from anywhere (panic hatch)
 //!   Ctrl-R         reload the note list
 //!   q              quit (asks if there are unsaved changes)
 //!
@@ -642,6 +644,14 @@ impl App {
             return false;
         }
 
+        // Ctrl-C is a panic hatch: quit immediately from ANY state (including
+        // inline-edit, where 'q' is shadowed by the textarea and Ctrl-S can be
+        // eaten by terminal flow control). Raw mode delivers it as a key event,
+        // not a SIGINT, so this always works.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+
         // Inline-edit mode captures keys for tui-textarea.
         if self.edit_mode {
             match key.code {
@@ -656,6 +666,14 @@ impl App {
                 }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.save_edit()
+                }
+                // Ctrl-X saves and leaves edit mode (flow-control-safe: unlike
+                // Ctrl-S it is never eaten by XOFF). This is the reliable way to
+                // finish editing when Ctrl-S does not reach the TUI; it always
+                // exits edit mode so the user is never trapped, even if save fails.
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = self.save_edit();
+                    self.edit_mode = false;
                 }
                 // Alt-S (Meta+S) and F2 are flow-control-safe alternatives to
                 // Ctrl-S: on some terminals/SSH sessions Ctrl-S is eaten by XOFF
@@ -1002,6 +1020,8 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("e", "edit the open note inline"),
     ("d", "delete the selected note (asks)"),
     ("Ctrl-S / Alt-S / F2", "save the inline edit (write + reindex)"),
+    ("Ctrl-X", "save + exit inline edit (flow-control-safe)"),
+    ("Ctrl-C", "quit immediately from anywhere"),
     ("PgUp/PgDn", "scroll the note body"),
     ("Home/End", "jump to top / bottom of body"),
     ("mouse wheel", "scroll the note body"),
@@ -1697,6 +1717,63 @@ mod app_tests {
 
         let _ = std::fs::remove_file(&abs);
         let _ = qmd::save(&abs, "");
+    }
+
+    // Ctrl-X saves and leaves edit mode (the flow-control-safe escape when
+    // Ctrl-S is eaten). Needs a usable index.
+    #[test]
+    fn ctrl_x_saves_and_exits_edit_mode() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-ctrlx-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        assert!(app.edit_mode, "editing after create");
+        for c in "saved via ctrl-x".chars() {
+            app.handle_key(key(c));
+        }
+        assert!(app.dirty);
+
+        app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!app.edit_mode, "Ctrl-X exits edit mode");
+        assert!(!app.dirty, "Ctrl-X clears dirty after save");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(content.contains("saved via ctrl-x"), "Ctrl-X wrote the file; got: {content:?}");
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
+    }
+
+    // Ctrl-C is a panic hatch: it quits from ANY state, including inline-edit
+    // (where 'q' is shadowed by the textarea). handle_key returns true.
+    #[test]
+    fn ctrl_c_quits_from_edit_mode() {
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        app.confirm_create();
+        if !app.edit_mode {
+            return; // no usable index in this run
+        }
+        let quit = app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(quit, "Ctrl-C should request quit");
+        assert!(!app.edit_mode, "Ctrl-C drops out of edit mode");
     }
 
     // Body scroll clamps: never negative, never past the last visible line for a

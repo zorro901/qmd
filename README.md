@@ -96,12 +96,14 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | `e` | Edit the open note inline (tui-textarea) |
 | `d` | Delete the selected note (asks to confirm) |
 | `Ctrl-S` / `Alt-S` / `F2` | Save the inline edit (write file + reindex) |
+| `Ctrl-X` | Save + exit inline edit (flow-control-safe) |
 | `PgUp` / `PgDn`, `Home` / `End`, mouse wheel | Scroll the note body |
 | click a list row | Select (and preview) that note |
 | `Ctrl-R` | Reload the note list |
 | `?` | Show keybindings |
 | `Esc` | Cancel search / discard edit (asks if unsaved) / close overlay |
 | `q` | Quit (asks if there are unsaved changes) |
+| `Ctrl-C` | Quit immediately from anywhere (panic hatch) |
 
 Search matches are highlighted in the list and in the open note (bold yellow),
 and the active collection shows in the list title.
