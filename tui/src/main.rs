@@ -1746,6 +1746,43 @@ mod app_tests {
         let _ = qmd::save(&abs, "");
     }
 
+    // Esc in edit mode on an EXISTING note (not a freshly created one) must save
+    // to disk. This exercises the open_abs path derived from preview_selected via
+    // qmd::get_body + resolve_abs. Regression guard for "Esc returns without saving".
+    #[test]
+    fn esc_on_existing_note_saves() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        // No notes means the index isn't set up for the test; skip gracefully.
+        if app.notes.is_empty() {
+            return;
+        }
+        let file = app.notes[0].file.clone();
+        app.list_state.select(Some(0));
+        app.preview_selected();
+        assert_eq!(app.open_file.as_deref(), Some(file.as_str()));
+        assert!(app.open_abs.is_some(), "preview should resolve open_abs");
+        app.start_edit();
+        assert!(app.edit_mode);
+        for c in "existing edit".chars() {
+            app.handle_key(key(c));
+        }
+        assert!(app.dirty);
+        let quit = app.handle_key(key_esc());
+        assert!(!quit);
+        assert!(!app.edit_mode, "edit mode exited on Esc");
+        assert!(!app.dirty, "dirty cleared after save");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(
+            content.contains("existing edit"),
+            "Esc wrote the existing note; got: {content:?}"
+        );
+        // Restore the file to its pre-test content so we don't leave junk.
+        let _ = qmd::save(&abs, &app.open_body);
+    }
+
+
     // Esc in edit mode saves the inline edit and leaves edit mode immediately
     // (never trapping the user behind a prompt), with no confirm arm.
     #[test]

@@ -105,18 +105,27 @@ pub fn search(query: &str, collection: Option<&str>) -> Result<Vec<Note>, String
 }
 
 /// Resolve a possibly-relative note path returned by `qmd multi-get --full-path`
-/// to an absolute on-disk path. `qmd` emits a *relative* path (e.g.
-/// `"./notes/alpha.md"`) even with `--full-path`, so we map the leading
-/// collection segment onto the directory from `qmd collection list`. Absolute
-/// paths (rare) pass through unchanged. Returns None only if the collection
-/// cannot be located, which would also block saving/deleting.
+/// to an absolute on-disk path.
+///
+/// IMPORTANT: `qmd multi-get --full-path` does NOT return the collection name in
+/// the path. It returns the on-disk relative path, e.g. `"./notes/n3.md"`, where
+/// the leading `notes` segment is the *directory name* of the collection's path
+/// (e.g. collection `t` is rooted at `/tmp/qmdnt/notes`), not the collection id.
+/// So we strip the `./`, take the first path segment, and match it against the
+/// *final segment of each collection's path* (not the collection name), then join
+/// the remainder. Absolute paths (rare) pass through unchanged. Returns None only
+/// if no collection directory matches (which would also block saving/deleting).
 fn resolve_abs(rel: &str) -> Option<PathBuf> {
     let cleaned = rel.strip_prefix("./").unwrap_or(rel);
-    let (coll_name, rest) = cleaned.split_once('/')?;
+    // Already absolute: keep as-is.
+    if cleaned.starts_with('/') {
+        return Some(PathBuf::from(cleaned));
+    }
+    let (dir_seg, rest) = cleaned.split_once('/')?;
     let collections = list_collections().ok()?;
     let dir = collections
         .into_iter()
-        .find(|(n, _)| n == coll_name)
+        .find(|(_, p)| p.file_name().map(|n| n == dir_seg).unwrap_or(false))
         .map(|(_, p)| p)?;
     Some(dir.join(rest))
 }
@@ -446,6 +455,38 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // Regression guard for "Esc returns without saving on an existing note": an
+    // existing note's absolute path must resolve (via qmd::get_body + resolve_abs)
+    // so that save() writes to the real on-disk file and the change persists. If
+    // resolve_abs returns None, save_edit() bails with "no note open" and the edit
+    // is silently lost.
+    #[test]
+    fn existing_note_save_roundtrip() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let notes = match list_notes(None) {
+            Ok(n) if !n.is_empty() => n,
+            _ => return, // no index available; skip
+        };
+        let note = &notes[0];
+        let (_, abs) = match get_body(&note.file) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let abs = match abs {
+            Some(a) => a,
+            None => panic!("resolve_abs returned None for existing note {}", note.file),
+        };
+        let before = std::fs::read_to_string(&abs).unwrap_or_default();
+        let marker = format!("\nVERIFY-ROUNDTRIP-{}\n", std::process::id());
+        let new_content = format!("{}{}", before, marker);
+        save(&abs, &new_content).expect("save should succeed for an existing note");
+        let after = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(
+            after.contains(&marker),
+            "existing note file was updated on disk; before={before} after={after}"
+        );
+        // Restore the original content so the test leaves no junk behind.
+        let _ = save(&abs, &before);
+    }
 }
-
-
