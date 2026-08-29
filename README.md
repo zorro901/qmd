@@ -104,7 +104,7 @@ qmd tui                            # or set QMD_TUI_BIN to a custom binary
 | `?` | Show keybindings |
 | `Esc` | In edit mode: save & exit · else cancel search / close overlay |
 | `q` | Quit (asks if there are unsaved changes) |
-| `Ctrl-C` | Quit immediately from anywhere (panic hatch) |
+| `Ctrl-C` | In edit mode: save & exit · elsewhere: quit immediately (panic hatch) |
 
 Search matches are highlighted in the list and in the open note (bold yellow),
 and the active collection shows in the list title.

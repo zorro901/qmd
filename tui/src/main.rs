@@ -587,14 +587,27 @@ impl App {
 
     /// Persist the inline edit: write the file, then reindex just that file.
     fn save_edit(&mut self) {
+        // Resolve the absolute on-disk path. Prefer the cached `open_abs` (set on
+        // preview/create); fall back to deriving it from `open_file` so a save
+        // still works even if preview didn't populate `open_abs` for some reason.
         let abs = match &self.open_abs {
             Some(p) => p.clone(),
-            None => {
-                self.status = "no note open".into();
-                return;
-            }
+            None => match &self.open_file {
+                Some(f) => match qmd::get_body(f) {
+                    Ok((_, Some(a))) => a,
+                    _ => {
+                        self.status = "no note open".into();
+                        return;
+                    }
+                },
+                None => {
+                    self.status = "no note open".into();
+                    return;
+                }
+            },
         };
         let content: String = self.textarea.lines().join("\n");
+        self.open_abs = Some(abs.clone());
         match qmd::save(&abs, &content) {
             Ok(()) => {
                 self.open_body = content;
@@ -714,21 +727,33 @@ impl App {
             return false;
         }
 
-        // Ctrl-C is a panic hatch: quit immediately from ANY state (including
-        // inline-edit, where 'q' is shadowed by the textarea and Ctrl-S can be
-        // eaten by terminal flow control). Raw mode delivers it as a key event,
-        // not a SIGINT, so this always works.
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Ctrl-C is a panic hatch: quit immediately from ANY non-edit state. Raw
+        // mode delivers it as a key event, not a SIGINT, so this always works.
+        // In edit mode it is handled below as save & exit (so work is never lost).
+        if !self.edit_mode
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
             return true;
         }
 
         // Inline-edit mode captures keys for tui-textarea.
         if self.edit_mode {
+            // Ctrl-C saves and exits edit mode. This is the most reliable escape
+            // hatch: raw mode always delivers Ctrl-C as a key event (never a
+            // SIGINT), so unlike Esc it cannot be consumed by the terminal/SSH
+            // layer. It saves first, so work is never lost.
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                let _ = self.save_edit();
+                self.edit_mode = false;
+                return false;
+            }
             match key.code {
                 // Esc saves the inline edit and leaves edit mode. This is the
                 // plain, modifier-free way out of editing (no Fn/Ctrl/Alt key
-                // needed); it always exits so the user is never trapped, even
-                // if the save fails. Use Ctrl-C to hard-quit without saving.
+                // needed); it always exits so the user is never trapped. If Esc
+                // is not delivered by the terminal/SSH layer, Ctrl-C also saves
+                // & exits (it is always delivered in raw mode).
                 KeyCode::Esc => {
                     let _ = self.save_edit();
                     self.edit_mode = false;
@@ -1115,6 +1140,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("Ctrl-R", "reload the note list"),
     ("q", "quit (asks if there are unsaved changes)"),
     ("Esc", "in edit mode: save & exit · else cancel search / close overlay"),
+    ("Ctrl-C", "in edit mode: save & exit · anywhere else: quit immediately"),
 ];
 
 fn self_collection_active(app: &App, name: &str) -> bool {
@@ -1172,7 +1198,7 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         ])
     } else if app.edit_mode {
         Line::from(vec![Span::styled(
-            "editing — autosaves · Esc saves & exits · Ctrl-C quit",
+            "editing — Esc or Ctrl-C saves & exits · autosaves · Ctrl-C quit",
             Style::default().fg(Color::Green),
         )])
     } else if app.creating {
@@ -1680,18 +1706,78 @@ mod app_tests {
         assert_eq!(app.open_body, "SENTINEL", "already-open note is not re-fetched");
     }
 
+    // Ctrl-C in edit mode saves the inline edit and leaves edit mode immediately,
+    // even if Esc is not delivered by the terminal. The most reliable escape hatch.
+    #[test]
+    fn ctrl_c_while_editing_saves_and_exits() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
+        let mut app = App::new();
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-ctrlc-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        assert!(app.edit_mode);
+        for c in "ctrl-c body".chars() {
+            app.handle_key(key(c));
+        }
+        assert!(app.dirty);
+        // In edit mode, Ctrl-C saves and exits (does NOT quit the whole app).
+        let quit = app.handle_key(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(!quit, "Ctrl-C in edit mode does not quit the app");
+        assert!(!app.edit_mode, "edit mode exited on Ctrl-C");
+        assert!(!app.dirty, "dirty cleared after Ctrl-C save");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(
+            content.contains("ctrl-c body"),
+            "Ctrl-C wrote the file; got: {content:?}"
+        );
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
+    }
+
     // Esc in edit mode saves the inline edit and leaves edit mode immediately
     // (never trapping the user behind a prompt), with no confirm arm.
     #[test]
     fn esc_while_editing_saves_and_exits() {
+        let _ = std::env::var("QMD_TUI_TEST_COLL_DIR");
         let mut app = App::new();
-        app.edit_mode = true;
-        app.dirty = true;
+        app.start_create();
+        if !app.creating {
+            return;
+        }
+        let name = format!("qmd-tui-esc-{}.md", std::process::id());
+        app.new_input = if app.new_input.ends_with('/') {
+            format!("{}{}", app.new_input, name)
+        } else {
+            format!("{}/{}", app.new_input, name)
+        };
+        app.confirm_create();
+        assert!(app.edit_mode);
+        for c in "esc body".chars() {
+            app.handle_key(key(c));
+        }
+        assert!(app.dirty);
         let quit = app.handle_key(key_esc());
         assert!(!quit);
         assert!(!app.edit_mode, "edit mode exited on Esc");
         assert!(app.confirm_pending.is_none(), "no confirm prompt armed");
         assert!(!app.dirty, "dirty cleared after save");
+        let abs = app.open_abs.clone().unwrap();
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        assert!(content.contains("esc body"), "Esc wrote the file; got: {content:?}");
+        let _ = std::fs::remove_file(&abs);
+        let _ = qmd::save(&abs, "");
     }
 
     // Drive the real key path (handle_key) to type into the textarea, save via
