@@ -323,10 +323,33 @@ fn unique_copy_name(dir: &Path, base: &str) -> String {
 /// Write `content` to `abs_path`, then reindex just that file via
 /// `qmd update --path <abs>` (O(changed), no full rescan).
 pub fn save(abs_path: &PathBuf, content: &str) -> Result<(), String> {
-    std::fs::write(abs_path, content).map_err(|e| format!("write failed: {e}"))?;
+    write_file(abs_path, content)?;
+    reindex_path(abs_path)
+}
+
+/// Write the file only. Instant; safe to call on the UI thread.
+pub fn write_file(abs_path: &PathBuf, content: &str) -> Result<(), String> {
+    std::fs::write(abs_path, content).map_err(|e| format!("write failed: {e}"))
+}
+
+/// Reindex one file (`qmd update --path`). Slow (~1s: Node CLI startup), so
+/// callers that care about UI latency spawn it on a thread.
+pub fn reindex_path(abs_path: &PathBuf) -> Result<(), String> {
     let abs_str = abs_path.to_string_lossy();
     run_qmd(&["update", "--path", &abs_str])?;
     Ok(())
+}
+
+/// Spawn `reindex_path` on a background thread; poll the returned receiver
+/// from the event loop to collect the result without blocking the UI.
+pub fn reindex_path_async(
+    abs_path: PathBuf,
+) -> std::sync::mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(reindex_path(&abs_path));
+    });
+    rx
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -120,6 +120,11 @@ struct App {
     /// Instant of the last keystroke while editing; used to debounce autosave so
     /// we don't shell out to qmd on every single character.
     last_edit: Option<Instant>,
+    /// Set while a background thread is reindexing after a save. The write
+    /// itself is synchronous (instant); only the `qmd update --path` child is
+    /// slow (~1s Node startup), so it runs off-thread and the UI never blocks.
+    /// The next event-loop tick collects the result and refreshes the list.
+    reindex_in_flight: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 }
 
 impl App {
@@ -153,6 +158,7 @@ impl App {
             last_key: String::new(),
             list_area: Rect::ZERO,
             last_edit: None,
+            reindex_in_flight: None,
         };
         app.reload_notes();
         // Open the first note so the right pane is populated immediately
@@ -608,24 +614,49 @@ impl App {
         };
         let content: String = self.textarea.lines().join("\n");
         self.open_abs = Some(abs.clone());
-        match qmd::save(&abs, &content) {
+        // Write is instant; only the reindex (~1s qmd startup) is slow, so it
+        // runs in the background and the UI stays responsive. The event loop
+        // collects the result and refreshes the list when it lands.
+        match qmd::write_file(&abs, &content) {
             Ok(()) => {
                 self.open_body = content;
                 self.dirty = false;
                 self.edit_mode = false;
                 self.last_edit = None;
-                self.status = "saved & reindexed".into();
-                // Refresh the list so a freshly created/edited note shows up
-                // (and the title reflects the new file) without a manual reload.
+                self.status = "saved — reindexing…".into();
+                self.reindex_in_flight = Some(qmd::reindex_path_async(abs));
+                // Keep the just-saved note selected in the list; the body and
+                // title in the list refresh when the background reindex lands.
+            }
+            Err(e) => self.status = format!("save error: {e}"),
+        }
+    }
+
+    /// Poll a in-flight background reindex, if any. Called every event-loop
+    /// tick; when the `qmd update --path` child finishes we surface the result
+    /// and refresh the note list (so new/renamed titles appear).
+    fn poll_reindex(&mut self) {
+        // try_recv() consumes the message, so take the receiver FIRST and use
+        // the value from that single recv attempt (doing a probe-recv and then
+        // another recv would lose the result).
+        let Some(rx) = self.reindex_in_flight.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.status = "saved".into();
                 self.reload_notes();
-                // Keep the just-saved note selected in the list.
                 if let Some(open) = &self.open_file {
                     if let Some(idx) = self.notes.iter().position(|n| &n.file == open) {
                         self.list_state.select(Some(idx));
                     }
                 }
             }
-            Err(e) => self.status = format!("save error: {e}"),
+            Ok(Err(e)) => self.status = format!("reindex error: {e}"),
+            // Still running: put the receiver back for the next tick.
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.reindex_in_flight = Some(rx),
+            // Thread died without sending (shouldn't happen); drop it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
 
@@ -656,17 +687,14 @@ impl App {
             },
         };
         let content: String = self.textarea.lines().join("\n");
-        match qmd::save(&abs, &content) {
+        // Instant write + background reindex, same as save_edit: the editor
+        // must never stall mid-typing on a ~1s qmd startup.
+        match qmd::write_file(&abs, &content) {
             Ok(()) => {
                 self.open_body = content;
                 self.dirty = false;
-                self.status = "autosaved".into();
-                self.reload_notes();
-                if let Some(open) = &self.open_file {
-                    if let Some(idx) = self.notes.iter().position(|n| &n.file == open) {
-                        self.list_state.select(Some(idx));
-                    }
-                }
+                self.status = "autosaved — reindexing…".into();
+                self.reindex_in_flight = Some(qmd::reindex_path_async(abs));
             }
             Err(e) => self.status = format!("autosave error: {e}"),
         }
@@ -1021,6 +1049,9 @@ fn run_app<B: ratatui::backend::Backend>(
         // Debounced autosave tick: persist edits ~2s after the last keystroke so
         // the user never loses work even if they forget to save before leaving.
         app.maybe_autosave();
+        // Collect a finished background reindex (from a save/autosave) and
+        // refresh the list when it lands. Non-blocking; the UI keeps running.
+        app.poll_reindex();
     }
     Ok(())
 }
@@ -1375,6 +1406,23 @@ mod app_tests {
         event::KeyEvent::new(KeyCode::End, KeyModifiers::empty())
     }
 
+    // In production the event loop's poll_reindex() collects the background
+    // `qmd update --path` and refreshes the list. Tests have no event loop, so
+    // this helper drives the same code path: wait (up to 15s) for the reindex
+    // thread, then pump poll_reindex once the result is ready.
+    fn drain_reindex(app: &mut App) {
+        for _ in 0..300 {
+            if app.reindex_in_flight.is_none() {
+                return;
+            }
+            app.poll_reindex();
+            if app.reindex_in_flight.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     // Headless integration test for the "new note" flow: start_create() ->
     // confirm_create() -> type into the textarea -> save_edit(). Verifies the
     // file is written with the typed content and reindexed. Skips without a
@@ -1404,6 +1452,7 @@ mod app_tests {
         app.textarea = TextArea::from(["# Created in TUI\nhello integration\n"]);
         app.save_edit();
         assert!(!app.dirty, "save should clear dirty flag");
+        drain_reindex(&mut app);
 
         let abs = app.open_abs.clone().unwrap();
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
@@ -1759,6 +1808,7 @@ mod app_tests {
         assert!(!quit, "Ctrl-C in edit mode does not quit the app");
         assert!(!app.edit_mode, "edit mode exited on Ctrl-C");
         assert!(!app.dirty, "dirty cleared after Ctrl-C save");
+        drain_reindex(&mut app);
         let abs = app.open_abs.clone().unwrap();
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
         assert!(
@@ -1796,6 +1846,7 @@ mod app_tests {
         assert!(!quit);
         assert!(!app.edit_mode, "edit mode exited on Esc");
         assert!(!app.dirty, "dirty cleared after save");
+        drain_reindex(&mut app);
         let abs = app.open_abs.clone().unwrap();
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
         assert!(
@@ -1835,6 +1886,7 @@ mod app_tests {
         assert!(!app.edit_mode, "edit mode exited on Esc");
         assert!(app.confirm_pending.is_none(), "no confirm prompt armed");
         assert!(!app.dirty, "dirty cleared after save");
+        drain_reindex(&mut app);
         let abs = app.open_abs.clone().unwrap();
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
         assert!(content.contains("esc body"), "Esc wrote the file; got: {content:?}");
@@ -1876,6 +1928,7 @@ mod app_tests {
         );
         app.handle_key(ctrl_s);
         assert!(!app.dirty, "save clears dirty");
+        drain_reindex(&mut app);
 
         let abs = app.open_abs.clone().unwrap();
         let content = std::fs::read_to_string(&abs).unwrap_or_default();
@@ -2371,6 +2424,7 @@ mod app_tests {
             KeyModifiers::CONTROL,
         ));
         assert!(!app.edit_mode, "save exits edit mode");
+        drain_reindex(&mut app);
         let present = app.notes.iter().any(|n| n.file.ends_with(&name));
         assert!(present, "saved note should be listed");
 
@@ -2415,6 +2469,7 @@ mod app_tests {
             KeyModifiers::CONTROL,
         ));
         assert!(!app.edit_mode, "save exits edit mode");
+        drain_reindex(&mut app);
         let present = app.notes.iter().any(|n| n.file.ends_with(&name));
         assert!(present, "saved note should be listed");
 
