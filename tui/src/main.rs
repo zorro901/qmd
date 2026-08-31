@@ -63,6 +63,11 @@ use tui_textarea::{Input, TextArea};
 /// double click (opens the inline editor).
 const DOUBLE_CLICK_MS: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// A note-body fetch running on a background thread, tagged with the note id
+/// it was started for, so a finished fetch can be dropped if the user has
+/// already moved the selection elsewhere while it was running.
+type BodyFetch = std::sync::mpsc::Receiver<Result<(String, Option<std::path::PathBuf>), String>>;
+
 /// Pending confirmation for a destructive action, so we never silently lose
 /// work: quitting while dirty (Enter quits WITHOUT saving, any other key
 /// cancels) or deleting the open/selected note.
@@ -144,6 +149,12 @@ struct App {
     /// slow (~1s Node startup), so it runs off-thread and the UI never blocks.
     /// The next event-loop tick collects the result and refreshes the list.
     reindex_in_flight: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// Set while a background thread fetches a note body for the preview pane
+    /// (`qmd multi-get`, ~0.5-1s). Keeps the UI responsive during clicks/keys:
+    /// the event loop collects the body when it lands and fills the pane then.
+    /// The selection may have moved on since; the fetch is tagged with the
+    /// note id it was started for and dropped if that note is no longer open.
+    load_in_flight: Option<(String, BodyFetch)>,
 }
 
 impl App {
@@ -183,6 +194,7 @@ impl App {
             list_area: Rect::ZERO,
             last_edit: None,
             reindex_in_flight: None,
+            load_in_flight: None,
         };
         app.reload_notes();
         // Open the first note so the right pane is populated immediately
@@ -346,16 +358,18 @@ impl App {
         if self.open_file.as_deref() == Some(&note.file) {
             return; // already showing this note
         }
-        match qmd::get_body(&note.file) {
-            Ok((body, abs)) => {
-                self.open_file = Some(note.file.clone());
-                self.open_body = body;
-                self.open_abs = abs;
-                self.dirty = false;
-                self.vertical_scroll = 0;
-            }
-            Err(e) => self.status = format!("open error: {e}"),
-        }
+        // The selection is applied INSTANTLY; only the body fetch is async.
+        // Shell-outs take ~0.5-1s (Node CLI startup), so blocking here froze
+        // the whole event loop: queued clicks/keys applied seconds late and
+        // the double-click window burned away. Mark the target immediately,
+        // fetch on a background thread, and fill the pane when it lands.
+        self.open_file = Some(note.file.clone());
+        self.open_body.clear();
+        self.open_abs = None;
+        self.dirty = false;
+        self.vertical_scroll = 0;
+        self.status = format!("loading {}…", note.file);
+        self.load_in_flight = Some((note.file.clone(), qmd::get_body_async(note.file)));
     }
 
     /// Move the list selection by `delta` rows (negative = up), clamped to the
@@ -460,6 +474,29 @@ impl App {
         if self.open_file.is_none() {
             self.status = "open a note first (Enter), then press e to edit".into();
             return;
+        }
+        // The preview body now loads asynchronously; open_abs is only set when
+        // the fetched body has actually landed. Editing before that would seed
+        // the textarea with an EMPTY body, and the first save would overwrite
+        // the file with nothing. If the user beats the fetch (fast 'e' after
+        // launch or a quick double click), do a one-off synchronous fetch for
+        // the open note — bounded to the same ~1s the old blocking preview
+        // always cost, and rare.
+        if self.open_abs.is_none() {
+            match self.open_file.as_deref().map(qmd::get_body) {
+                Some(Ok((body, abs))) => {
+                    self.open_body = body;
+                    self.open_abs = abs;
+                }
+                Some(Err(e)) => {
+                    self.status = format!("open error: {e}");
+                    return;
+                }
+                None => {
+                    self.status = "open a note first (Enter), then press e to edit".into();
+                    return;
+                }
+            }
         }
         self.textarea = TextArea::from(self.open_body.split('\n'));
         self.edit_mode = true;
@@ -679,6 +716,42 @@ impl App {
             Ok(Err(e)) => self.status = format!("reindex error: {e}"),
             // Still running: put the receiver back for the next tick.
             Err(std::sync::mpsc::TryRecvError::Empty) => self.reindex_in_flight = Some(rx),
+            // Thread died without sending (shouldn't happen); drop it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+
+    /// Poll an in-flight background preview fetch, if any. Called every
+    /// event-loop tick; when the `qmd multi-get` child finishes we fill the
+    /// preview pane — unless the user has moved on to another note (or into
+    /// edit mode) while the fetch was running, in which case the stale body
+    /// is dropped and the pane waits for the fetch that matches the open id.
+    fn poll_load(&mut self) {
+        let Some((wanted, rx)) = self.load_in_flight.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((body, abs))) => {
+                // Show the body only if this note is still the open one and
+                // we are not editing (edit mode owns the textarea).
+                if !self.edit_mode && self.open_file.as_deref() == Some(wanted.as_str()) {
+                    self.open_body = body;
+                    self.open_abs = abs;
+                    self.vertical_scroll = 0;
+                    self.status = "loaded".into();
+                }
+            }
+            Ok(Err(e)) => {
+                if self.open_file.as_deref() == Some(wanted.as_str()) {
+                    self.status = format!("open error: {e}");
+                    self.open_file = None;
+                    self.open_body.clear();
+                }
+            }
+            // Still running: put the receiver back for the next tick.
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.load_in_flight = Some((wanted, rx));
+            }
             // Thread died without sending (shouldn't happen); drop it.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
@@ -1105,8 +1178,8 @@ impl App {
                         self.list_state.select(Some(row));
                         self.preview_selected();
                     }
-                    // Stamp AFTER the preview so the double-click window does
-                    // not burn away while we were blocked on a qmd call.
+                    // The fetch is async now, so stamping is cheap; the
+                    // window is measured from the actual press time.
                     self.last_click = Some((std::time::Instant::now(), m.row));
                 } else {
                     self.last_click = None;
@@ -1238,6 +1311,8 @@ fn run_app<B: ratatui::backend::Backend>(
         // Collect a finished background reindex (from a save/autosave) and
         // refresh the list when it lands. Non-blocking; the UI keeps running.
         app.poll_reindex();
+        // Collect a finished background preview fetch and fill the pane.
+        app.poll_load();
     }
     Ok(())
 }
@@ -1599,6 +1674,21 @@ mod app_tests {
     }
     fn key_end() -> event::KeyEvent {
         event::KeyEvent::new(KeyCode::End, KeyModifiers::empty())
+    }
+
+    // Same helper for preview loads: pump poll_load until the in-flight
+    // `qmd multi-get` fetch lands (or give up after 15s).
+    fn drain_load(app: &mut App) {
+        for _ in 0..300 {
+            if app.load_in_flight.is_none() {
+                return;
+            }
+            app.poll_load();
+            if app.load_in_flight.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     // In production the event loop's poll_reindex() collects the background
@@ -2192,6 +2282,7 @@ mod app_tests {
         let file = app.notes[0].file.clone();
         app.list_state.select(Some(0));
         app.preview_selected();
+        drain_load(&mut app); // the fetch is async; pump it like the event loop
         assert_eq!(app.open_file.as_deref(), Some(file.as_str()));
         assert!(app.open_abs.is_some(), "preview should resolve open_abs");
         app.start_edit();

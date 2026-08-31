@@ -192,6 +192,19 @@ pub fn get_body(file: &str) -> Result<(String, Option<PathBuf>), String> {
     Ok((first.body, abs))
 }
 
+/// Spawn `get_body` on a background thread; poll the returned receiver from
+/// the event loop to collect the result without blocking the UI. Clicks and
+/// keys keep flowing while `qmd multi-get` runs (~0.5-1s of Node CLI startup).
+pub fn get_body_async(
+    file: String,
+) -> std::sync::mpsc::Receiver<Result<(String, Option<PathBuf>), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(get_body(&file));
+    });
+    rx
+}
+
 /// Delete a note file and reindex its collection so it disappears from search.
 /// `file` is the qmd note id ("collection/path.md"); the on-disk path is
 /// resolved via `qmd multi-get --full-path`. The collection is reindexed with
