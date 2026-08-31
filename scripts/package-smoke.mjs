@@ -58,6 +58,20 @@ assertPath("dist/cli/qmd.js", "compiled CLI");
 run("compiled CLI under Node", process.execPath, ["dist/cli/qmd.js", "--help"], { quiet: true });
 run("package wrapper", "sh", ["bin/qmd", "--help"], { quiet: true });
 
+// qmd-tui: staged binary must exist and be executable. `qmd tui` falls back to
+// a PATH lookup when it is missing, so absence is only a warning, but a staged
+// binary that is not executable would break the bundled launch path.
+const tuiBin = join(root, "bin", "qmd-tui");
+if (existsSync(tuiBin)) {
+  if ((statSync(tuiBin).mode & 0o111) === 0) {
+    console.error(`Package smoke failed: bin/qmd-tui is not executable`);
+    process.exit(1);
+  }
+  console.log("==> bundled qmd-tui staged and executable");
+} else {
+  console.warn("==> bin/qmd-tui not staged (cargo absent at build time); `qmd tui` will fall back to PATH");
+}
+
 if (process.env.QMD_SKIP_BUN_SMOKE === "1") {
   console.log("==> compiled CLI under Bun (skipped by QMD_SKIP_BUN_SMOKE=1)");
 } else {
