@@ -38,9 +38,10 @@ Requirements: python3, a qmd index with a test collection. Configure via env:
 Usage (from tui/):
     QMD_BIN=/path/to/qmd python3 scripts/pty_acceptance.py [--full]
 
-Exit 0 only if BOTH scenarios pass. The PTY quirk to know about: the pty must
-be given a real window size via TIOCSWINSZ, otherwise ratatui renders nothing
-and every assertion fails with an empty screen.
+Exit 0 only if every scenario passes (2 by default, 7 with --full). The PTY
+quirk to know about: the pty must be given a real window size via TIOCSWINSZ,
+otherwise ratatui renders nothing and every assertion fails with an empty
+screen.
 """
 
 import fcntl
