@@ -150,6 +150,21 @@ npx vitest run --reporter=verbose test/
 bun test --preload ./src/test-preload.ts test/
 ```
 
+## Terminal UI (tui/)
+
+Rust crate (`tui/`), a ratatui front-end that shells out to the `qmd` CLI —
+never touch the SQLite index or markdown files from the TUI directly.
+
+```sh
+cd tui && cargo build --release              # build
+cargo clippy --all-targets                   # lint (must stay warning-free)
+cargo test                                   # 52 headless tests (need a qmd index; see src/qmd.rs test env vars)
+python3 scripts/pty_acceptance.py [--full]   # real-PTY acceptance against ../bin/qmd-tui
+```
+
+`bin/qmd-tui` is gitignored; stage it for `qmd tui` via `npm run build` or
+`cp tui/target/release/qmd-tui bin/qmd-tui`.
+
 ## Architecture
 
 - SQLite FTS5 for full-text search (BM25)
