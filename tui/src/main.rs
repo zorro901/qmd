@@ -20,10 +20,12 @@
 //!   e              edit the open note inline (tui-textarea)
 //!   d              delete the selected note (asks to confirm)
 //!   PgUp/PgDn · Home/End · mouse wheel   scroll the note body
-//!   Esc            leave search · discard inline edit (asks if unsaved) · quit prompt
+//!   Esc            in edit mode: save & exit · else leave search / close overlay
 //!   Ctrl-S / Alt-S / F2   save the inline edit (write file + reindex)
 //!   Ctrl-X / Alt-X    save + exit inline edit (flow-control-safe)
-//!   Ctrl-C             quit immediately from anywhere (panic hatch)
+//!   Ctrl-C             in edit mode: save & exit · else quit immediately (panic hatch)
+//!   mouse          click select · double click edit · right click delete (asks)
+//!                  · middle click duplicate · drag select · wheel scroll/move
 //!   Ctrl-R         reload the note list
 //!   q              quit (asks if there are unsaved changes)
 //!
@@ -62,8 +64,8 @@ use tui_textarea::{Input, TextArea};
 const DOUBLE_CLICK_MS: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Pending confirmation for a destructive action, so we never silently lose
-/// work: quitting while dirty, discarding an inline edit while dirty, or
-/// deleting the open/selected note.
+/// work: quitting while dirty (Enter quits WITHOUT saving, any other key
+/// cancels) or deleting the open/selected note.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     Quit,
@@ -1546,7 +1548,7 @@ fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
                 "Select a note on the left, then press Enter to open it.\n\n\
                  Keys: / search · ↑↓ move · Enter open · n new note · e edit inline\n\
                  c switch collection · d delete · Ctrl-S save · ? help · q quit\n\
-                 Unsaved edits: q asks, Esc in editor asks, Enter confirms discard/quit\n\
+                 Unsaved edits: q asks before quitting · Esc in the editor saves & exits\n\
                  Scroll: mouse wheel · PgUp/PgDn · Home/End",
             ),
         };
