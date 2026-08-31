@@ -57,6 +57,10 @@ use ratatui::{
 };
 use tui_textarea::{Input, TextArea};
 
+/// Window in which a second left-click on the same list row counts as a
+/// double click (opens the inline editor).
+const DOUBLE_CLICK_MS: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Pending confirmation for a destructive action, so we never silently lose
 /// work: quitting while dirty, discarding an inline edit while dirty, or
 /// deleting the open/selected note.
@@ -98,6 +102,17 @@ struct App {
     vertical_scroll: u16,
     /// Last executed search query, used to highlight matches in the list.
     query: String,
+    /// Instant of the last left-click on a list row; a second click within
+    /// DOUBLE_CLICK_MS on the same row opens the inline editor.
+    last_click: Option<(std::time::Instant, u16)>,
+    /// Row (screen y) captured when a press begins, for drag-select in the list.
+    drag_anchor: Option<u16>,
+    /// Screen rectangle of the collection-picker popup, captured each draw so
+    /// mouse clicks can select entries directly.
+    pick_area: Rect,
+    /// Screen rectangle of the note-body pane (right pane), captured each draw
+    /// so mouse wheel events can be routed to scrolling that pane only.
+    body_area: Rect,
     /// Active collection filter (None = all collections).
     collection: Option<String>,
     /// Available collections, loaded for the switcher picker.
@@ -114,6 +129,8 @@ struct App {
     debug_keys: bool,
     /// Last raw key event string, shown when `debug_keys` is on.
     last_key: String,
+    /// Last raw mouse event string, shown when `debug_keys` is on.
+    last_mouse: String,
     /// Screen rectangle of the note list, refreshed each draw, so mouse clicks
     /// can be mapped to a list row for click-to-select.
     list_area: Rect,
@@ -149,6 +166,10 @@ impl App {
             confirm_pending: None,
             vertical_scroll: 0,
             query: String::new(),
+            last_click: None,
+            drag_anchor: None,
+            pick_area: Rect::ZERO,
+            body_area: Rect::ZERO,
             collection: None,
             collections: Vec::new(),
             collection_idx: 0,
@@ -156,6 +177,7 @@ impl App {
             show_help: false,
             debug_keys: false,
             last_key: String::new(),
+            last_mouse: String::new(),
             list_area: Rect::ZERO,
             last_edit: None,
             reindex_in_flight: None,
@@ -973,29 +995,107 @@ impl App {
         false
     }
 
-    /// Handle mouse events: wheel scrolling moves the note body; clicking a row
-    /// in the list selects (and previews) it. Other mouse interactions are
-    /// ignored.
+    /// Handle mouse events: wheel scrolls the note body (or moves the list
+    /// selection when over the list), click selects, double click edits,
+    /// right click arms delete, middle click duplicates, drag selects. While
+    /// the collection picker or help overlay is open the mouse interacts with
+    /// that overlay; while editing, the textarea handles wheel and clicks.
     fn handle_mouse(&mut self, m: MouseEvent) {
-        if self.edit_mode {
+        if self.debug_keys {
+            self.last_mouse = format!("{m:?}");
+        }
+        // Overlays capture the mouse first: clicking an entry picks it, clicking
+        // outside dismisses — same as Esc.
+        if self.show_help {
+            self.show_help = false;
             return;
         }
+        if self.picking {
+            match m.kind {
+                MouseEventKind::Down(_) => {
+                    if let Some(idx) = self.pick_row_at(m.row, m.column) {
+                        self.collection_idx = idx;
+                        self.confirm_pick_collection();
+                    } else {
+                        self.picking = false; // click outside the popup cancels
+                    }
+                }
+                MouseEventKind::ScrollUp => {
+                    let len = self.collections.len() + 1; // + "All collections"
+                    self.collection_idx = self.collection_idx.saturating_sub(1).min(len - 1);
+                }
+                MouseEventKind::ScrollDown => {
+                    let len = self.collections.len() + 1;
+                    self.collection_idx = (self.collection_idx + 1).min(len - 1);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // While editing, the textarea owns the body pane: route wheel scrolling
+        // into it and place the cursor on click. Other clicks are ignored.
+        if self.edit_mode {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    self.textarea.input(Input::from(MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        ..m
+                    }));
+                }
+                MouseEventKind::ScrollUp => {
+                    self.textarea.input(Input::from(MouseEvent {
+                        kind: MouseEventKind::ScrollUp,
+                        ..m
+                    }));
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let area = self.body_area;
+                    let inner_top = area.y + 1;
+                    let inner_left = area.x + 1;
+                    if m.row >= inner_top && m.column >= inner_left {
+                        let row = m.row - inner_top;
+                        let col = m.column - inner_left;
+                        self.textarea.move_cursor(tui_textarea::CursorMove::Jump(row, col));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match m.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll_body(3, self.open_body.lines().count(), usize::MAX);
+                // Wheel over the body pane scrolls the note; over the list it
+                // moves the selection (SimpleNote-style wheel navigation).
+                if self.in_body(m.row, m.column) {
+                    self.scroll_body(3, self.open_body.lines().count(), usize::MAX);
+                } else {
+                    self.move_selection(3);
+                }
             }
             MouseEventKind::ScrollUp => {
-                self.scroll_body(-3, self.open_body.lines().count(), usize::MAX);
+                if self.in_body(m.row, m.column) {
+                    self.scroll_body(-3, self.open_body.lines().count(), usize::MAX);
+                } else {
+                    self.move_selection(-3);
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Map the click to a list row. The list has a 1-line border, so
-                // the first item sits one row below the area's top.
-                let inner_top = self.list_area.y.saturating_add(1);
-                if m.row < inner_top || self.list_area.x > m.column || m.column > self.list_area.right() {
-                    return;
-                }
-                let row = (m.row - inner_top) as usize;
-                if row < self.notes.len() {
+                if let Some(row) = self.list_row_at(m.row, m.column) {
+                    self.drag_anchor = Some(m.row);
+                    // Double click on the same row opens the inline editor.
+                    let double = self
+                        .last_click
+                        .take()
+                        .map(|(t, r)| {
+                            t.elapsed() <= DOUBLE_CLICK_MS && r == m.row
+                        })
+                        .unwrap_or(false);
+                    if double {
+                        self.start_edit();
+                        return;
+                    }
                     let cur = self.list_state.selected().unwrap_or(0);
                     // A click on the already-selected row is a no-op; otherwise
                     // move the selection (which previews the note).
@@ -1003,10 +1103,94 @@ impl App {
                         self.list_state.select(Some(row));
                         self.preview_selected();
                     }
+                    // Stamp AFTER the preview so the double-click window does
+                    // not burn away while we were blocked on a qmd call.
+                    self.last_click = Some((std::time::Instant::now(), m.row));
+                } else {
+                    self.last_click = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                // Drag-select: follow the pointer while the button is held,
+                // extending the selection from the press anchor row.
+                if self.drag_anchor.is_some() {
+                    if let Some(idx) = self.list_row_at(m.row, m.column) {
+                        let cur = self.list_state.selected().unwrap_or(0);
+                        if idx != cur {
+                            self.list_state.select(Some(idx));
+                            self.preview_selected();
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Up(_) => {
+                self.drag_anchor = None;
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                // Right click selects the row under the pointer and arms the
+                // delete confirmation (same guard as the `d` key: Enter
+                // confirms, any other key cancels).
+                if let Some(row) = self.list_row_at(m.row, m.column) {
+                    let cur = self.list_state.selected().unwrap_or(0);
+                    if row != cur {
+                        self.list_state.select(Some(row));
+                        self.preview_selected();
+                    }
+                    self.arm_delete();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Middle) => {
+                // Middle click duplicates the note under the pointer (same as `y`).
+                if let Some(row) = self.list_row_at(m.row, m.column) {
+                    let cur = self.list_state.selected().unwrap_or(0);
+                    if row != cur {
+                        self.list_state.select(Some(row));
+                        self.preview_selected();
+                    }
+                    self.duplicate_selected();
                 }
             }
             _ => {}
         }
+    }
+
+    /// True when the given screen position is inside the note-body pane.
+    fn in_body(&self, row: u16, column: u16) -> bool {
+        let a = self.body_area;
+        a.width > 0
+            && row >= a.y
+            && row < a.y.saturating_add(a.height)
+            && column >= a.x
+            && column < a.x.saturating_add(a.width)
+    }
+
+    /// Map a click position to a list row index, if it lands on a visible item.
+    fn list_row_at(&self, row: u16, column: u16) -> Option<usize> {
+        let inner_top = self.list_area.y.saturating_add(1);
+        if row < inner_top || self.list_area.x > column || column > self.list_area.right() {
+            return None;
+        }
+        self.list_row_index(row)
+    }
+
+    /// Map a screen row to a list index accounting for the border offset.
+    fn list_row_index(&self, row: u16) -> Option<usize> {
+        let inner_top = self.list_area.y.saturating_add(1);
+        let r = row.checked_sub(inner_top)? as usize;
+        if r < self.notes.len() { Some(r) } else { None }
+    }
+
+    /// Map a click position to an index in the collection-picker popup
+    /// (0 = "All collections", 1.. = real collections), or None when the click
+    /// is outside the popup.
+    fn pick_row_at(&self, row: u16, column: u16) -> Option<usize> {
+        let popup = self.pick_area;
+        if popup.width == 0 || column < popup.x || column >= popup.x + popup.width {
+            return None;
+        }
+        let idx = row.checked_sub(popup.y.saturating_add(1))? as usize;
+        let len = self.collections.len() + 1;
+        if idx < len { Some(idx) } else { None }
     }
 }
 
@@ -1088,6 +1272,8 @@ fn render_collection_picker(f: &mut Frame<'_>, app: &mut App) {
         width,
         height,
     };
+    // Remember the popup rectangle so mouse clicks can pick entries directly.
+    app.pick_area = popup;
     f.render_widget(Clear, popup);
 
     let mut state = ListState::default();
@@ -1128,7 +1314,7 @@ fn render_collection_picker(f: &mut Frame<'_>, app: &mut App) {
 fn render_help(f: &mut Frame<'_>) {
     use ratatui::widgets::Clear;
     let area = f.area();
-    let width = 54.min(area.width.saturating_sub(4));
+    let width = 66.min(area.width.saturating_sub(4));
     let lines = HELP_LINES.len() as u16;
     let height = (lines + 2).min(area.height.saturating_sub(4));
     let x = area.width.saturating_sub(width) / 2;
@@ -1181,8 +1367,9 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("Ctrl-C", "quit immediately from anywhere"),
     ("PgUp/PgDn", "scroll the note body"),
     ("Home/End", "jump to top / bottom of body"),
-    ("mouse wheel", "scroll the note body"),
-    ("click", "select a note in the list (body previews)"),
+    ("mouse wheel", "scroll the note body · over the list: move the selection"),
+    ("click", "select a note · double click: edit · drag: select"),
+    ("right / middle click", "delete (asks) / duplicate the clicked note"),
     ("?", "show this help"),
     ("Ctrl-R", "reload the note list"),
     ("q", "quit (asks if there are unsaved changes)"),
@@ -1305,7 +1492,10 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         .collect();
 
     let status = if app.debug_keys {
-        format!("{}  | last key: {}", app.status, app.last_key)
+        format!(
+            "{}  | last key: {} | last mouse: {}",
+            app.status, app.last_key, app.last_mouse
+        )
     } else {
         app.status.clone()
     };
@@ -1332,6 +1522,9 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
 }
 
 fn render_body(f: &mut Frame<'_>, app: &mut App, area: Rect) {
+    // Remember the body pane's screen rectangle so mouse wheel events can be
+    // routed to body scrolling (and edit-mode clicks can place the cursor).
+    app.body_area = area;
     let title = match &app.open_file {
         Some(file) => {
             let marker = if app.dirty { " ●" } else { "" };
@@ -1739,6 +1932,169 @@ mod app_tests {
         };
         app.handle_mouse(outside);
         assert_eq!(app.list_state.selected(), Some(3), "click outside list ignored");
+    }
+
+    fn click(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn app_with_notes(n: usize) -> App {
+        let mut app = App::new();
+        app.notes = (0..n)
+            .map(|i| qmd::Note {
+                file: format!("t/n{i}.md"),
+                title: format!("n{i}"),
+                mtime: String::new(),
+            })
+            .collect();
+        app.list_state.select(Some(0));
+        // Simulate the drawn list rectangle: top border at y=2, first row at y=3.
+        app.list_area = Rect::new(0, 2, 40, 20);
+        app
+    }
+
+    #[test]
+    fn double_click_opens_edit() {
+        let _guard = qmd::qmd_test_lock(); // App::new() shells out to qmd
+        let mut app = app_with_notes(5);
+        // First click selects (t/n3).
+        app.handle_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            5,
+            6, // row index 3
+        ));
+        assert_eq!(app.list_state.selected(), Some(3));
+        assert!(!app.edit_mode);
+
+        // Second click on the same row within the window opens the editor.
+        app.handle_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            5,
+            6,
+        ));
+        assert!(app.edit_mode, "double click should open the inline editor");
+
+        // A slow or moved second click must NOT edit: simulate by clearing
+        // last_click (as if the window elapsed) and clicking another row.
+        let mut app2 = app_with_notes(5);
+        app2.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 5, 6));
+        app2.last_click = None; // window elapsed
+        app2.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 5, 6));
+        assert!(!app2.edit_mode, "elapsed second click must not edit");
+    }
+
+    #[test]
+    fn right_click_arms_delete_and_left_confirms() {
+        let _guard = qmd::qmd_test_lock();
+        let mut app = app_with_notes(5);
+        // Right click row 2: selection follows, delete confirmation arms.
+        app.handle_mouse(click(
+            MouseEventKind::Down(MouseButton::Right),
+            5,
+            5, // row index 2
+        ));
+        assert_eq!(app.list_state.selected(), Some(2), "right click selects row");
+        assert!(matches!(app.confirm_pending, Some(Confirm::Delete)), "right click arms delete");
+        // Enter confirms (destructive action still needs explicit confirm).
+        app.handle_key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.confirm_pending.is_none());
+    }
+
+    #[test]
+    fn middle_click_duplicates_selected() {
+        let _guard = qmd::qmd_test_lock();
+        // duplicate_selected shells out to qmd; without a test collection it
+        // reports an error status instead of mutating anything. We only assert
+        // the mouse wiring: middle click reaches the duplicate path.
+        let mut app = app_with_notes(5);
+        app.handle_mouse(click(
+            MouseEventKind::Down(MouseButton::Middle),
+            5,
+            4, // row index 1
+        ));
+        assert_eq!(app.list_state.selected(), Some(1), "middle click selects row");
+        assert!(
+            app.status.contains("duplicated") || app.status.contains("error"),
+            "middle click routed to duplicate: got {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn drag_selects_rows_under_pointer() {
+        let _guard = qmd::qmd_test_lock();
+        let mut app = app_with_notes(8);
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 5, 3)); // row 0 press
+        assert_eq!(app.list_state.selected(), Some(0));
+        // Drag down to row 5 while held: selection follows.
+        app.handle_mouse(click(MouseEventKind::Drag(MouseButton::Left), 5, 8)); // row 5
+        assert_eq!(app.list_state.selected(), Some(5), "drag moves selection");
+        // Release ends the drag; moving afterwards must not change selection.
+        app.handle_mouse(click(MouseEventKind::Up(MouseButton::Left), 5, 8));
+        app.handle_mouse(click(MouseEventKind::Drag(MouseButton::Left), 5, 4)); // row 1
+        assert_eq!(app.list_state.selected(), Some(5), "drag after release ignored");
+    }
+
+    #[test]
+    fn wheel_over_list_moves_selection_not_scroll() {
+        let _guard = qmd::qmd_test_lock();
+        let mut app = app_with_notes(8);
+        app.list_area = Rect::new(0, 2, 40, 20);
+        app.body_area = Rect::new(41, 2, 40, 20);
+        // Wheel over the list (column inside list area).
+        app.handle_mouse(click(MouseEventKind::ScrollDown, 5, 6));
+        assert_eq!(app.list_state.selected(), Some(3), "wheel over list moves selection");
+        // Wheel over the body pane scrolls the body instead.
+        let before = app.vertical_scroll;
+        app.handle_mouse(click(MouseEventKind::ScrollDown, 60, 6));
+        assert!(
+            app.vertical_scroll > before || app.open_body.lines().count() <= 3,
+            "wheel over body scrolls body"
+        );
+        assert_eq!(app.list_state.selected(), Some(3), "body wheel keeps selection");
+    }
+
+    #[test]
+    fn click_on_collection_picker_selects_entry() {
+        let _guard = qmd::qmd_test_lock();
+        let mut app = app_with_notes(2);
+        app.collections = vec![
+            ("work".to_string(), std::path::PathBuf::from("/tmp/work")),
+            ("notes".to_string(), std::path::PathBuf::from("/tmp/notes")),
+        ];
+        app.picking = true;
+        // Simulate the popup rect drawn by render_collection_picker for this
+        // state: width 40, height = items(3) + borders = 6, centered. Exact
+        // geometry doesn't matter; we just need rows inside the popup.
+        app.pick_area = Rect::new(10, 5, 40, 6);
+        // Click the first real collection: popup row 1 (below "All collections")
+        // sits at screen y = pick_area.y + 1 border + 1 = 7.
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 15, 7));
+        assert!(!app.picking, "click closes the picker");
+        assert_eq!(app.collection.as_deref(), Some("work"), "clicked entry applied");
+
+        // Click outside the popup cancels without changing the filter.
+        let mut app2 = app_with_notes(2);
+        app2.collections = vec![("work".to_string(), std::path::PathBuf::from("/tmp/work"))];
+        app2.picking = true;
+        app2.pick_area = Rect::new(10, 5, 40, 5);
+        app2.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 1, 20));
+        assert!(!app2.picking, "outside click cancels picker");
+        assert!(app2.collection.is_none(), "filter unchanged");
+    }
+
+    #[test]
+    fn click_dismisses_help_overlay() {
+        let _guard = qmd::qmd_test_lock();
+        let mut app = app_with_notes(2);
+        app.show_help = true;
+        app.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 15, 6));
+        assert!(!app.show_help, "click closes help");
     }
 
     // App::new loads the index and immediately previews the first note, so the

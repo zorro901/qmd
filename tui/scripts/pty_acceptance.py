@@ -100,7 +100,10 @@ def run_session(env, cwd, label, steps, kill=True):
         os.chdir(cwd)
         os.execve(env["QMD_TUI_BIN"], [env["QMD_TUI_BIN"]], env)
     # CRITICAL: give the PTY a real size or ratatui renders nothing.
-    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+    # Wide on purpose: the list pane is 40% of the width and the status text
+    # (e.g. the delete confirmation prompt) lives at the END of the list
+    # title, truncated away on narrow terminals. 240 cols keeps it visible.
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 240, 0, 0))
 
     out = b""
 
@@ -271,6 +274,61 @@ def main():
         print(f"[ctrl-c list] app quit immediately: {quit_ok}")
         kill_session(pid, fd)
         results["ctrl-c-quit-hatch"] = quit_ok
+
+        # 6: Mouse scenarios against the real binary via SGR sequences.
+        # The list pane spans the full terminal height; its border is at
+        # screen row 1, so list index i lives at row i+2. The dir holds two
+        # notes (qmd-acc-note.md, qmd-acc-second.md), so valid rows are 2
+        # (first note) and 3 (second note).
+        marker6 = f"{os.getpid()}888"  # digits only: no key letters inside
+        note2 = os.path.join(cwd, "qmd-acc-second.md")
+        with open(note2, "w") as f:
+            f.write(f"# second {marker6}\n")
+        subprocess.run([env["QMD_BIN"], "update", "--path", note2],
+                       env=env, check=False, cwd=cwd)
+
+        def sgr_click(col, row, m=0):
+            # SGR mouse encoding: ESC [ < b ; c ; r M (press) / m (release)
+            return f"\x1b[<{m};{col};{row}M".encode() + \
+                   f"\x1b[<{m};{col};{row}m".encode()
+
+        out6, pid, fd = run_session(env, cwd, "mouse", [
+            (3.0, None),             # startup: notes[0] previewed
+            (1.0, None),
+            # Click the SECOND note (row 3 => index 1) to select it.
+            (2.5, sgr_click(10, 3)),
+            # Double click it within the window -> inline editor opens.
+            (0.8, sgr_click(10, 3)),
+            # Type a digit-only marker; Esc saves.
+            (1.0, marker6.encode()),
+            (2.0, b"\x1b"),
+        ], kill=False)
+        edit_ok = False
+        try:
+            edit_ok = marker6 in open(note2).read() and alive(pid)
+        except OSError:
+            pass
+        kill_session(pid, fd)
+        print(f"[mouse] double click opened editor & saved marker: {edit_ok}")
+        results["mouse-doubleclick-edit"] = edit_ok
+
+        out7, pid, fd = run_session(env, cwd, "mouse-delete", [
+            (3.0, None),
+            (1.0, None),
+            # Right click the SECOND note arms the delete confirmation. The
+            # prompt lives in the list title (status bar), which differential
+            # redraws render as fragments, so match a whitespace-free fragment.
+            (2.0, sgr_click(10, 3, 2)),
+        ], kill=False)
+        flat = re.sub(r"\s+", "", vis(out7))
+        # Differential redraws interleave status-bar cells, which escape
+        # stripping scrambles ("delete this note?" may surface as
+        # "delethisnote?" etc). Match fragments that survive mangling.
+        prompt_visible = ("todelete" in flat and "anyother" in flat) or \
+            "deletethisnote?" in flat or "delethisnote?" in flat
+        print(f"[mouse] right click shows delete prompt: {prompt_visible}")
+        kill_session(pid, fd)
+        results["mouse-rightclick-delete-prompt"] = prompt_visible
 
     # --- Verdict -------------------------------------------------------------
     failed = [k for k, v in results.items() if not v]

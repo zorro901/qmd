@@ -106,8 +106,11 @@ cp tui/target/release/qmd-tui bin/qmd-tui
 | `Ctrl-S` / `Alt-S` / `F2` | Save the inline edit (write file + reindex) |
 | `Ctrl-X` / `Alt-X` | Save + exit inline edit (flow-control-safe) |
 | (automatic) | While editing, changes autosave ~2s after you stop typing |
-| `PgUp` / `PgDn`, `Home` / `End`, mouse wheel | Scroll the note body |
-| click a list row | Select (and preview) that note |
+| `PgUp` / `PgDn`, `Home` / `End`, mouse wheel | Scroll the note body · wheel over the list moves the selection |
+| click a list row | Select (and preview) that note · double click opens the editor · drag moves the selection |
+| right click | Delete the clicked note (asks to confirm) |
+| middle click | Duplicate the clicked note |
+| click in the collection picker / help | Pick an entry / dismiss |
 | `Ctrl-R` | Reload the note list |
 | `?` | Show keybindings |
 | `Esc` | In edit mode: save & exit · else cancel search / close overlay |
@@ -126,12 +129,14 @@ cd tui && cargo test
 ```
 
 The end-to-end acceptance path is covered by a real-PTY harness that launches
-the actual `qmd-tui` binary, sends real keystrokes (`e`, typing, `Esc`, `q`),
-and verifies edits land on disk — once via the autosave debounce (no save key
-pressed) and once via `Esc` on an existing note:
+the actual `qmd-tui` binary, sends real keystrokes (`e`, typing, `Esc`, `q`)
+and real SGR mouse sequences, and verifies edits land on disk — once via the
+autosave debounce (no save key pressed) and once via `Esc` on an existing
+note. `--full` adds multiline-Enter, Ctrl-C edge cases, and the mouse
+scenarios (double click edits, right click arms the delete prompt):
 
 ```sh
-cd tui && QMD_BIN=/path/to/qmd python3 scripts/pty_acceptance.py
+cd tui && QMD_BIN=/path/to/qmd python3 scripts/pty_acceptance.py [--full]
 ```
 
 It uses a throwaway index under `/tmp` by default; see the script header for
