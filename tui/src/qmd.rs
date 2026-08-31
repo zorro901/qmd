@@ -322,6 +322,11 @@ fn unique_copy_name(dir: &Path, base: &str) -> String {
 
 /// Write `content` to `abs_path`, then reindex just that file via
 /// `qmd update --path <abs>` (O(changed), no full rescan).
+///
+/// The app itself writes with `write_file` and reindexes on a background
+/// thread (`reindex_path_async`); this synchronous combo is what the unit
+/// tests use to set up note content.
+#[cfg(test)]
 pub fn save(abs_path: &PathBuf, content: &str) -> Result<(), String> {
     write_file(abs_path, content)?;
     reindex_path(abs_path)
@@ -334,7 +339,7 @@ pub fn write_file(abs_path: &PathBuf, content: &str) -> Result<(), String> {
 
 /// Reindex one file (`qmd update --path`). Slow (~1s: Node CLI startup), so
 /// callers that care about UI latency spawn it on a thread.
-pub fn reindex_path(abs_path: &PathBuf) -> Result<(), String> {
+pub fn reindex_path(abs_path: &Path) -> Result<(), String> {
     let abs_str = abs_path.to_string_lossy();
     run_qmd(&["update", "--path", &abs_str])?;
     Ok(())
