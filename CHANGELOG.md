@@ -6,6 +6,25 @@
 
 - Added Oxlint lint fence.
 
+- `qmd tui` (the SimpleNote-style terminal UI) now supports the mouse end to
+  end. Click a list row to select it, double click to open the inline editor,
+  right click to arm the delete confirmation (Enter is still required), middle
+  click to duplicate, and drag to move the selection. The wheel scrolls the
+  note body over the body pane and moves the selection over the list; clicks
+  work in the collection picker and dismiss the help overlay; while editing,
+  wheel and clicks go to the editor itself.
+
+### Fixed
+
+- `qmd tui`: saving no longer freezes the UI. The file write (~1ms) stays on
+  the UI thread while the `qmd update --path` reindex (~1.2-1.7s of Node CLI
+  startup per save) runs on a background thread, so typing and scrolling stay
+  responsive during and after every save, including the autosave debounce.
+
+- `qmd tui`: Esc and Ctrl-C inside the inline editor now reliably save & exit
+  across terminals and SSH sessions. Ctrl-X / Alt-X / Alt-S / F2 remain as
+  flow-control-safe alternatives for terminals where Ctrl-S is eaten by XOFF.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
