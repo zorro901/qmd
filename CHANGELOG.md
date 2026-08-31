@@ -14,6 +14,10 @@
   work in the collection picker and dismiss the help overlay; while editing,
   wheel and clicks go to the editor itself.
 
+- The package smoke test now verifies the staged `bin/qmd-tui` binary is
+  executable (the tarball ships the binary, not the `tui/` sources, so a
+  non-executable staging step would break `qmd tui` out of the box).
+
 ### Fixed
 
 - `qmd tui`: saving no longer freezes the UI. The file write (~1ms) stays on
