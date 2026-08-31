@@ -20,6 +20,13 @@
 
 ### Fixed
 
+- `qmd tui`: clicking a note now selects it instantly. Previously every click
+  and arrow key ran a synchronous `qmd multi-get` inside the UI loop (~1s), so
+  rapid clicks lagged seconds behind and felt unresponsive. The selection
+  applies immediately and the preview body loads in the background; a fast
+  edit-after-launch now falls back to a one-off fetch instead of risking an
+  empty-body overwrite.
+
 - `qmd tui`: saving no longer freezes the UI. The file write (~1ms) stays on
   the UI thread while the `qmd update --path` reindex (~1.2-1.7s of Node CLI
   startup per save) runs on a background thread, so typing and scrolling stay
