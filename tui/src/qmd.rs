@@ -192,6 +192,27 @@ pub fn get_body(file: &str) -> Result<(String, Option<PathBuf>), String> {
     Ok((first.body, abs))
 }
 
+/// Pure resolver: map a note id ("collection/path.md", "qmd://collection/path")
+/// to an absolute on-disk path using ONLY the collection list (name or the
+/// collection root's final directory segment) — no `qmd` child is spawned.
+/// This is what makes instant preview possible: the note id always starts with
+/// the collection name (or, for legacy ids, the root directory segment), so
+/// `root / rest` reconstructs the on-disk path in nanoseconds.
+pub fn note_abs_path(file: &str, collections: &[(String, PathBuf)]) -> Option<PathBuf> {
+    let cleaned = file.strip_prefix("qmd://").unwrap_or(file);
+    let (first, rest) = cleaned.split_once('/')?;
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some((_, p)) = collections.iter().find(|(n, _)| n == first) {
+        return Some(p.join(rest));
+    }
+    collections
+        .iter()
+        .find(|(_, p)| p.file_name().map(|n| n == first).unwrap_or(false))
+        .map(|(_, p)| p.join(rest))
+}
+
 /// Spawn `get_body` on a background thread; poll the returned receiver from
 /// the event loop to collect the result without blocking the UI. Clicks and
 /// keys keep flowing while `qmd multi-get` runs (~0.5-1s of Node CLI startup).

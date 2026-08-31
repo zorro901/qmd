@@ -68,6 +68,41 @@ const DOUBLE_CLICK_MS: std::time::Duration = std::time::Duration::from_millis(40
 /// already moved the selection elsewhere while it was running.
 type BodyFetch = std::sync::mpsc::Receiver<Result<(String, Option<std::path::PathBuf>), String>>;
 
+/// A note-list refresh running on a background thread (`qmd notes`, ~1s of
+/// Node CLI startup). The generation tag lets `poll_list` drop results from a
+/// superseded refresh.
+type ListFetch = std::sync::mpsc::Receiver<(u64, Result<Vec<qmd::Note>, String>)>;
+
+/// A live search running on a background thread (`qmd search`, ~1s of Node
+/// CLI startup). Tagged with the query so stale results can be dropped.
+type SearchFetch = std::sync::mpsc::Receiver<(String, Result<Vec<qmd::Note>, String>)>;
+
+/// Spawn a note-list refresh on a background thread. The returned receiver is
+/// polled from the event loop; the generation tag lets stale results be
+/// dropped when a newer search/reload superseded this fetch.
+fn spawn_list_fetch(
+    gen: u64,
+    collection: Option<String>,
+) -> std::sync::mpsc::Receiver<(u64, Result<Vec<qmd::Note>, String>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = qmd::list_notes(collection.as_deref());
+        let _ = tx.send((gen, result));
+    });
+    rx
+}
+
+/// Spawn a live search on a background thread. Tagged with the trimmed query
+/// so `poll_search` can drop results that no longer match what is in the box.
+fn spawn_search_fetch(q: String, collection: Option<String>) -> SearchFetch {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = qmd::search(&q, collection.as_deref());
+        let _ = tx.send((q, result));
+    });
+    rx
+}
+
 /// Pending confirmation for a destructive action, so we never silently lose
 /// work: quitting while dirty (Enter quits WITHOUT saving, any other key
 /// cancels) or deleting the open/selected note.
@@ -155,6 +190,31 @@ struct App {
     /// The selection may have moved on since; the fetch is tagged with the
     /// note id it was started for and dropped if that note is no longer open.
     load_in_flight: Option<(String, BodyFetch)>,
+    /// Set while a background thread refreshes the note list (`qmd notes`,
+    /// ~1s Node CLI startup). A reload request while one is already running
+    /// coalesces: the running fetch is replaced and a fresh one started only
+    /// if a request arrived after it (see `reload_notes_async`).
+    list_in_flight: Option<ListFetch>,
+    /// Set when `reload_notes_async` was called while a list refresh was
+    /// already running, so the finished refresh is followed by one more.
+    list_refresh_queued: bool,
+    /// Generation counter for list refreshes; results from a stale generation
+    /// (superseded search/reload) are dropped instead of clobbering the list.
+    list_generation: u64,
+    /// Set while a background thread runs a search (`qmd search`). Debounced
+    /// live search results land here; stale results are dropped by generation.
+    search_in_flight: Option<SearchFetch>,
+    /// Set when `run_search` fired while a search was already running, so the
+    /// finishing search is followed by one more (latest query wins).
+    search_refresh_queued: bool,
+    /// Note id to select + preview once the next list refresh lands (used by
+    /// duplicate/rename so the affected note stays front and center without
+    /// blocking the UI while the ~1s `qmd notes` fetch runs).
+    pending_select: Option<String>,
+    /// True once the collection cache has been populated (startup or picker).
+    /// Instant preview needs it to map note ids to on-disk paths; until then
+    /// preview falls back to the async `qmd multi-get` fetch.
+    collections_loaded: bool,
 }
 
 impl App {
@@ -195,7 +255,19 @@ impl App {
             last_edit: None,
             reindex_in_flight: None,
             load_in_flight: None,
+            list_in_flight: None,
+            list_refresh_queued: false,
+            list_generation: 0,
+            search_in_flight: None,
+            search_refresh_queued: false,
+            pending_select: None,
+            collections_loaded: false,
         };
+        // Warm the collection cache synchronously ONCE at startup (~1s at
+        // launch, acceptable) so instant preview can map note ids to on-disk
+        // paths without ever shelling out per keystroke/click afterwards.
+        app.load_collections();
+        app.collections_loaded = true;
         app.reload_notes();
         // Open the first note so the right pane is populated immediately
         // (SimpleNote-style preview without an explicit Enter).
@@ -206,7 +278,39 @@ impl App {
         app
     }
 
+    /// Refresh the note list WITHOUT blocking the event loop. `qmd notes` is a
+    /// ~1s shell-out (Node CLI startup), so it runs on a background thread and
+    /// `poll_list` applies the result when it lands. A request while one is
+    /// already running just sets `list_refresh_queued`; the finisher starts one
+    /// more refresh so the final state is always fresh.
+    fn reload_notes_async(&mut self) {
+        if self.list_in_flight.is_some() {
+            self.list_refresh_queued = true;
+            return;
+        }
+        self.list_generation += 1;
+        let gen = self.list_generation;
+        let coll = self.collection.clone();
+        self.list_in_flight = Some(spawn_list_fetch(gen, coll));
+    }
+
+    /// Synchronous refresh: kept for startup and tests where there is no event
+    /// loop to poll. Blocks for ~1s (one `qmd notes` shell-out) and then
+    /// applies the result with the same code path as the async refresh.
     fn reload_notes(&mut self) {
+        let coll = self.collection.clone();
+        self.list_generation += 1;
+        let gen = self.list_generation;
+        match qmd::list_notes(coll.as_deref()) {
+            Ok(notes) => self.apply_notes(gen, notes),
+            Err(e) => self.status = format!("error: {e}"),
+        }
+    }
+
+    /// Apply a fetched note list: status line, cursor anchoring by note id,
+    /// and re-preview when the open note vanished. Shared by the sync reload
+    /// and the async `poll_list` applier.
+    fn apply_notes(&mut self, _gen: u64, notes: Vec<qmd::Note>) {
         // Anchor on the currently selected note id so the cursor lands back on
         // the same note after the list is rebuilt (instead of snapping to top).
         let anchor = self
@@ -214,72 +318,135 @@ impl App {
             .selected()
             .and_then(|i| self.notes.get(i).map(|n| n.file.clone()));
         let prev_sel = self.list_state.selected();
-        let coll: Option<&str> = self.collection.as_deref();
-        match qmd::list_notes(coll) {
-            Ok(notes) => {
-                self.notes = notes;
-                self.query = String::new();
-                if self.notes.is_empty() {
-                    self.status = "no notes — run 'qmd collection add .' then 'qmd update'".into();
-                } else {
-                    self.status = match &self.collection {
-                        Some(c) => format!("{} notes in {}", self.notes.len(), c),
-                        None => format!("{} notes", self.notes.len()),
-                    };
-                }
-                if !self.notes.is_empty() {
-                    // Land the cursor back on the same note by id (list order can
-                    // shift between loads); fall back to the old position, then top.
-                    let pos = anchor
+        self.notes = notes;
+        self.query = String::new();
+        if self.notes.is_empty() {
+            self.status = "no notes — run 'qmd collection add .' then 'qmd update'".into();
+        } else {
+            self.status = match &self.collection {
+                Some(c) => format!("{} notes in {}", self.notes.len(), c),
+                None => format!("{} notes", self.notes.len()),
+            };
+        }
+        if !self.notes.is_empty() {
+            // A duplicate/rename asked to land on its note: highest priority.
+            let pending_pos = self
+                .pending_select
+                .take()
+                .and_then(|id| self.notes.iter().position(|n| n.file == id));
+            // Land the cursor back on the same note by id (list order can
+            // shift between loads); fall back to the old position, then top.
+            let pos = pending_pos
+                .or_else(|| {
+                    anchor
                         .as_ref()
                         .and_then(|id| self.notes.iter().position(|n| &n.file == id))
-                        .or(prev_sel.filter(|p| *p < self.notes.len()))
-                        .unwrap_or(0);
-                    self.list_state.select(Some(pos));
-                    // Keep the currently open note if it survived the reload;
-                    // otherwise re-preview whatever is now selected so the right
-                    // pane never points at a stale note.
-                    if self
-                        .open_file
-                        .as_ref()
-                        .map(|f| self.notes.iter().any(|n| &n.file == f))
-                        .unwrap_or(false)
-                    {
-                        // already showing a note that survived the reload
-                    } else {
-                        self.preview_selected();
+                })
+                .or(prev_sel.filter(|p| *p < self.notes.len()))
+                .unwrap_or(0);
+            self.list_state.select(Some(pos));
+            // Keep the currently open note if it survived the reload; otherwise
+            // re-preview whatever is now selected so the right pane never
+            // points at a stale note.
+            if self
+                .open_file
+                .as_ref()
+                .map(|f| self.notes.iter().any(|n| &n.file == f))
+                .unwrap_or(false)
+            {
+                // already showing a note that survived the reload
+            } else {
+                self.preview_selected();
+            }
+        } else {
+            self.list_state.select(None);
+            self.open_file = None;
+            self.open_body.clear();
+            self.open_abs = None;
+        }
+    }
+
+    /// Poll an in-flight background list refresh. Called every event-loop
+    /// tick. Results from a stale generation (a newer search/reload superseded
+    /// them) are dropped; a queued refresh request starts one more fetch so
+    /// the list ends up fresh.
+    fn poll_list(&mut self) {
+        let Some(rx) = self.list_in_flight.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((gen, result)) => {
+                if gen == self.list_generation {
+                    match result {
+                        Ok(notes) => self.apply_notes(gen, notes),
+                        Err(e) => self.status = format!("error: {e}"),
                     }
-                } else {
-                    self.list_state.select(None);
-                    self.open_file = None;
-                    self.open_body.clear();
-                    self.open_abs = None;
+                }
+                if self.list_refresh_queued {
+                    self.list_refresh_queued = false;
+                    self.reload_notes_async();
                 }
             }
-            Err(e) => self.status = format!("error: {e}"),
+            // Still running: put the receiver back for the next tick.
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.list_in_flight = Some(rx),
+            // Thread died without sending (shouldn't happen); drop it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+
+    /// Poll an in-flight background search. Applies results only when the
+    /// finished search's query is still the live one; a queued request starts
+    /// one more search for the latest query.
+    fn poll_search(&mut self) {
+        let Some(rx) = self.search_in_flight.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((q, result)) => {
+                // Apply only if the user hasn't kept typing (query changed) or
+                // left search mode since the search started.
+                if self.searching && self.search_input.trim() == q {
+                    match result {
+                        Ok(notes) => {
+                            self.query = q.to_lowercase();
+                            self.notes = notes;
+                            self.status = format!("{} results for '{}'", self.notes.len(), q);
+                            if self.notes.is_empty() {
+                                self.list_state.select(None);
+                            } else {
+                                self.list_state.select(Some(0));
+                            }
+                        }
+                        Err(e) => self.status = format!("search error: {e}"),
+                    }
+                }
+                if self.search_refresh_queued {
+                    self.search_refresh_queued = false;
+                    self.run_search();
+                }
+            }
+            // Still running: put the receiver back for the next tick.
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.search_in_flight = Some(rx),
+            // Thread died without sending (shouldn't happen); drop it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
 
     fn run_search(&mut self) {
-        let q = self.search_input.trim();
+        let q = self.search_input.trim().to_string();
         if q.is_empty() {
-            self.reload_notes();
+            // Non-blocking refresh: the query box was cleared, restore the
+            // full list via the background loader.
+            self.reload_notes_async();
             return;
         }
-        self.query = q.to_lowercase();
-        let coll: Option<&str> = self.collection.as_deref();
-        match qmd::search(q, coll) {
-            Ok(notes) => {
-                self.notes = notes;
-                self.status = format!("{} results for '{}'", self.notes.len(), q);
-                if self.notes.is_empty() {
-                    self.list_state.select(None);
-                } else {
-                    self.list_state.select(Some(0));
-                }
-            }
-            Err(e) => self.status = format!("search error: {e}"),
+        if self.search_in_flight.is_some() {
+            // A search is already running; queue one more so the latest query
+            // still lands (debounce-by-coalescing instead of freezing).
+            self.search_refresh_queued = true;
+            return;
         }
+        self.search_in_flight = Some(spawn_search_fetch(q, self.collection.clone()));
     }
 
     /// Refresh the list of indexed collections for the switcher picker. The
@@ -328,7 +495,9 @@ impl App {
         self.open_file = None;
         self.open_body.clear();
         self.open_abs = None;
-        self.reload_notes();
+        // Background refresh: switching collections must not freeze the UI on
+        // a ~1s shell-out; poll_list applies the list when it lands.
+        self.reload_notes_async();
     }
 
     fn open_selected(&mut self) {
@@ -358,18 +527,35 @@ impl App {
         if self.open_file.as_deref() == Some(&note.file) {
             return; // already showing this note
         }
-        // The selection is applied INSTANTLY; only the body fetch is async.
-        // Shell-outs take ~0.5-1s (Node CLI startup), so blocking here froze
-        // the whole event loop: queued clicks/keys applied seconds late and
-        // the double-click window burned away. Mark the target immediately,
-        // fetch on a background thread, and fill the pane when it lands.
+        // INSTANT PREVIEW: the note id ("collection/path.md") plus the cached
+        // collection roots reconstruct the on-disk path without any shell-out,
+        // and the FILE is the source of truth — reading it is ~0ms versus
+        // ~1s of Node CLI startup for `qmd multi-get`. Only when the pure
+        // resolver or the file read fails do we fall back to the async
+        // multi-get fetch (e.g. ids not mappable to a known collection root).
         self.open_file = Some(note.file.clone());
         self.open_body.clear();
         self.open_abs = None;
         self.dirty = false;
         self.vertical_scroll = 0;
-        self.status = format!("loading {}…", note.file);
-        self.load_in_flight = Some((note.file.clone(), qmd::get_body_async(note.file)));
+        let mut loaded = false;
+        if self.collections_loaded {
+            if let Some(abs) = qmd::note_abs_path(&note.file, &self.collections) {
+                // File missing/undreadable -> keep `loaded == false` and fall
+                // through to the async fetch, which surfaces qmd's own error
+                // if it is a real index problem rather than a resolver gap.
+                if let Ok(body) = std::fs::read_to_string(&abs) {
+                    self.open_body = body;
+                    self.open_abs = Some(abs);
+                    self.status = "loaded".into();
+                    loaded = true;
+                }
+            }
+        }
+        if !loaded {
+            self.status = format!("loading {}…", note.file);
+            self.load_in_flight = Some((note.file.clone(), qmd::get_body_async(note.file)));
+        }
     }
 
     /// Move the list selection by `delta` rows (negative = up), clamped to the
@@ -424,9 +610,11 @@ impl App {
         };
         match qmd::duplicate_note(&note.file) {
             Ok(new_id) => {
-                self.reload_notes();
                 self.status = format!("duplicated to {new_id}");
-                // Select and preview the freshly created copy.
+                // Background refresh; the copy is selected + previewed when
+                // the fresh list arrives (or now if it is already present).
+                self.reload_notes_async();
+                self.pending_select = Some(new_id.clone());
                 if let Some(pos) = self.notes.iter().position(|n| n.file == new_id) {
                     self.list_state.select(Some(pos));
                     self.preview_selected();
@@ -457,7 +645,9 @@ impl App {
                     self.edit_mode = false;
                 }
                 self.status = format!("deleted {}", note.file);
-                self.reload_notes();
+                // Background refresh: deletion already removed the file, so
+                // the UI must stay responsive while the index catches up.
+                self.reload_notes_async();
                 // Keep a valid selection after the list shrinks.
                 if !self.notes.is_empty() {
                     let max = self.notes.len() - 1;
@@ -637,12 +827,18 @@ impl App {
                 // If the moved note was open, point the open pane at the new id.
                 if self.open_file.as_deref() == Some(&from) {
                     self.open_file = Some(raw.clone());
-                    // open_abs is now stale; refresh it via multi-get.
-                    if let Ok((_, abs)) = qmd::get_body(&raw) {
+                    // open_abs is stale after the move; re-resolve purely
+                    // (collection root + new relative path), no shell-out.
+                    if self.collections_loaded {
+                        self.open_abs = qmd::note_abs_path(&raw, &self.collections);
+                    } else if let Ok((_, abs)) = qmd::get_body(&raw) {
                         self.open_abs = abs;
                     }
                 }
-                self.reload_notes();
+                // Background refresh; the renamed note is re-selected when the
+                // fresh list arrives (or now if already present).
+                self.reload_notes_async();
+                self.pending_select = Some(raw.clone());
                 // Keep the renamed note selected in the list if still present.
                 if let Some(idx) = self.notes.iter().position(|n| n.file == raw) {
                     self.list_state.select(Some(idx));
@@ -706,7 +902,9 @@ impl App {
         match rx.try_recv() {
             Ok(Ok(())) => {
                 self.status = "saved".into();
-                self.reload_notes();
+                // Background refresh: the ~1s `qmd notes` shell-out must not
+                // freeze the event loop right after every save/autosave.
+                self.reload_notes_async();
                 if let Some(open) = &self.open_file {
                     if let Some(idx) = self.notes.iter().position(|n| &n.file == open) {
                         self.list_state.select(Some(idx));
@@ -970,7 +1168,9 @@ impl App {
                     // Cancel: clear the box and restore the full note list.
                     self.searching = false;
                     self.search_input.clear();
-                    self.reload_notes();
+                    self.query.clear();
+                    // Esc must be instant; the ~1s reload runs off-thread.
+                    self.reload_notes_async();
                 }
                 KeyCode::Char(c) => {
                     self.search_input.push(c);
@@ -1313,6 +1513,9 @@ fn run_app<B: ratatui::backend::Backend>(
         app.poll_reindex();
         // Collect a finished background preview fetch and fill the pane.
         app.poll_load();
+        // Collect finished background list refreshes / live searches.
+        app.poll_list();
+        app.poll_search();
     }
     Ok(())
 }
