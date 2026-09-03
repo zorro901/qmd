@@ -53,6 +53,14 @@
   highlighted the *previous* query for up to ~1s after each keystroke; it is
   now set synchronously in `run_search()` before the background fetch starts.
 
+- `qmd tui`: pressing `n`/`+` then Enter without typing a filename (the
+  pre-filled prompt reads `<collection>/`, easy to confirm as-is) used to
+  cancel with the abstract `use '<collection>/<file>.md' format` — which
+  reads as a rejected format, not an instruction — and gave no visible
+  feedback beyond the status line, which looked like the keypress did
+  nothing. It now says `type a filename after '<collection>/' (e.g.
+  note.md), then Enter`.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security

@@ -752,6 +752,14 @@ impl App {
         // Split "<collection>/<path>" so we know which directory to write into.
         let (coll_name, rel) = match raw.split_once('/') {
             Some((c, p)) if !c.is_empty() && !p.is_empty() => (c.to_string(), p.to_string()),
+            // The prompt pre-fills "<collection>/"; confirming that unchanged
+            // is the common case (Enter pressed before typing a filename), so
+            // it gets a message that says what to type next rather than the
+            // abstract format hint below.
+            Some((c, p)) if !c.is_empty() && p.is_empty() => {
+                self.status = format!("type a filename after '{c}/' (e.g. note.md), then Enter");
+                return;
+            }
             _ => {
                 self.status = "use '<collection>/<file>.md' format".into();
                 return;
@@ -1924,6 +1932,27 @@ mod app_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    // Pressing Enter right after 'n' without typing a filename must not
+    // silently do nothing. The prompt pre-fills "<collection>/"; confirming
+    // that unchanged should cancel with a message telling the user exactly
+    // what to type next — not the abstract "<collection>/<file>.md format"
+    // hint, which reads as a rejected format rather than an instruction to
+    // keep typing. This path never reaches qmd::list_collections(), so it
+    // needs no index and runs everywhere.
+    #[test]
+    fn create_empty_filename_gives_actionable_error() {
+        let mut app = App::new();
+        app.creating = true;
+        app.new_input = "notes/".into();
+        app.confirm_create();
+        assert!(!app.creating, "prompt closes");
+        assert_eq!(
+            app.status,
+            "type a filename after 'notes/' (e.g. note.md), then Enter",
+            "status should tell the user exactly what to type next"
+        );
     }
 
     // Headless integration test for the "new note" flow: start_create() ->
