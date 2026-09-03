@@ -36,6 +36,17 @@
   across terminals and SSH sessions. Ctrl-X / Alt-X / Alt-S / F2 remain as
   flow-control-safe alternatives for terminals where Ctrl-S is eaten by XOFF.
 
+- `qmd tui`: reloading the note list and live search no longer block the UI.
+  Both ran `qmd notes` / `qmd search` (~1s of Node CLI startup) synchronously
+  in the event loop; they now run on a background thread and results land via
+  polling, tagged by generation/query so a stale fetch superseded by a newer
+  reload or keystroke is dropped instead of clobbering the list.
+
+- `qmd tui`: the key-debug toggle moved from F12 to Ctrl-D. F12 is routinely
+  intercepted by the terminal, OS, or multiplexer before it reaches the TUI —
+  exactly the terminals where a "what key did you actually send" diagnostic is
+  needed.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security
