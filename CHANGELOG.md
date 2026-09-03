@@ -47,6 +47,12 @@
   exactly the terminals where a "what key did you actually send" diagnostic is
   needed.
 
+- `qmd tui`: live search highlighting no longer lags behind typing. The async
+  note-list/search change (above) moved the highlight query update into the
+  background search result instead of setting it immediately, so the list
+  highlighted the *previous* query for up to ~1s after each keystroke; it is
+  now set synchronously in `run_search()` before the background fetch starts.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security

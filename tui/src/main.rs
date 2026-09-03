@@ -409,7 +409,9 @@ impl App {
                 if self.searching && self.search_input.trim() == q {
                     match result {
                         Ok(notes) => {
-                            self.query = q.to_lowercase();
+                            // `self.query` was already set synchronously in
+                            // run_search() (drives highlighting live as the
+                            // user types); only the result list lands here.
                             self.notes = notes;
                             self.status = format!("{} results for '{}'", self.notes.len(), q);
                             if self.notes.is_empty() {
@@ -436,11 +438,20 @@ impl App {
     fn run_search(&mut self) {
         let q = self.search_input.trim().to_string();
         if q.is_empty() {
+            // Clear the highlight query immediately so it never lags behind
+            // the box going empty — apply_notes() would also clear it once
+            // the background reload lands, but that must not be the only
+            // path (the reload is async and may take ~1s).
+            self.query = String::new();
             // Non-blocking refresh: the query box was cleared, restore the
             // full list via the background loader.
             self.reload_notes_async();
             return;
         }
+        // Set the highlight query immediately, before the fetch even starts:
+        // it drives list highlighting only and must track what's in the box
+        // as the user types, not lag behind the ~1s `qmd search` shell-out.
+        self.query = q.to_lowercase();
         if self.search_in_flight.is_some() {
             // A search is already running; queue one more so the latest query
             // still lands (debounce-by-coalescing instead of freezing).
@@ -2257,10 +2268,46 @@ mod app_tests {
         app
     }
 
+    /// Like `app_with_notes`, but the notes are backed by REAL files on disk
+    /// under a collection root cached in `app.collections`. `preview_selected`'s
+    /// instant path (`note_abs_path` + `fs::read_to_string`) resolves them with
+    /// no `qmd` shell-out and no background fetch, so `open_abs` lands
+    /// synchronously — required by tests (e.g. double-click-to-edit) that need
+    /// `start_edit` to see a real `open_abs` without polling an async fetch.
+    fn app_with_real_notes(n: usize) -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "qmd-tui-mouse-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut app = App::new();
+        app.collections = vec![("t".to_string(), dir.clone())];
+        app.collections_loaded = true;
+        app.notes = (0..n)
+            .map(|i| {
+                let name = format!("n{i}.md");
+                let _ = std::fs::write(dir.join(&name), format!("# n{i}\nbody\n"));
+                qmd::Note {
+                    file: format!("t/{name}"),
+                    title: format!("n{i}"),
+                    mtime: String::new(),
+                }
+            })
+            .collect();
+        app.list_state.select(Some(0));
+        app.list_area = Rect::new(0, 2, 40, 20);
+        app.preview_selected();
+        app
+    }
+
     #[test]
     fn double_click_opens_edit() {
         let _guard = qmd::qmd_test_lock(); // App::new() shells out to qmd
-        let mut app = app_with_notes(5);
+        // start_edit() needs a real open_abs (falls back to a synchronous
+        // `qmd::get_body` shell-out otherwise, which fails without an index),
+        // so this uses real temp-file-backed notes rather than app_with_notes.
+        let mut app = app_with_real_notes(5);
         // First click selects (t/n3).
         app.handle_mouse(click(
             MouseEventKind::Down(MouseButton::Left),
@@ -2280,7 +2327,7 @@ mod app_tests {
 
         // A slow or moved second click must NOT edit: simulate by clearing
         // last_click (as if the window elapsed) and clicking another row.
-        let mut app2 = app_with_notes(5);
+        let mut app2 = app_with_real_notes(5);
         app2.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 5, 6));
         app2.last_click = None; // window elapsed
         app2.handle_mouse(click(MouseEventKind::Down(MouseButton::Left), 5, 6));
@@ -2918,7 +2965,13 @@ mod app_tests {
         app.run_search();
         assert_eq!(app.query, "project", "query is stored lower-cased");
 
-        // A reload (e.g. Ctrl-R or post-save) clears the highlight query.
+        // A reload (e.g. Ctrl-R or post-save) clears the highlight query via
+        // apply_notes() — but only when qmd actually answers; without a usable
+        // index reload_notes() leaves `query` untouched and just surfaces the
+        // shell-out error in `status`, so skip rather than assert on that.
+        if qmd::list_notes(None).is_err() {
+            return;
+        }
         app.reload_notes();
         assert_eq!(app.query, "", "reload clears the highlight query");
     }
