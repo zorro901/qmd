@@ -226,18 +226,29 @@ pub fn get_body_async(
     rx
 }
 
+/// Delete the file at `abs` on disk. Instant; safe to call on the UI thread.
+/// Reindexing (dropping the file from qmd's index) is a separate, slower step
+/// — see `reindex_collections_async`.
+pub fn delete_file(abs: &Path) -> Result<(), String> {
+    std::fs::remove_file(abs).map_err(|e| format!("delete failed: {e}"))
+}
+
 /// Delete a note file and reindex its collection so it disappears from search.
 /// `file` is the qmd note id ("collection/path.md"); the on-disk path is
 /// resolved via `qmd multi-get --full-path`. The collection is reindexed with
 /// `qmd update -c <name>`, which drops the now-missing file from the index.
+/// Synchronous end-to-end (path resolution + delete + reindex); the app
+/// itself resolves the path via the cached collection list and reindexes on a
+/// background thread instead (see `App::delete_selected`) — this combo is
+/// only used by tests, hence `#[cfg(test)]`.
+#[cfg(test)]
 pub fn delete_note(file: &str) -> Result<(), String> {
-    // Resolve the absolute path.
     let (_, abs) = get_body(file)?;
     let abs = match abs {
         Some(p) => p,
         None => return Err(format!("could not resolve path for {file}")),
     };
-    std::fs::remove_file(&abs).map_err(|e| format!("delete failed: {e}"))?;
+    delete_file(&abs)?;
     // Reindex the owning collection (cheaper than a full update). The collection
     // name is the first path segment of the note id.
     let coll = file
@@ -245,97 +256,40 @@ pub fn delete_note(file: &str) -> Result<(), String> {
         .next()
         .filter(|c| !c.is_empty())
         .ok_or_else(|| format!("malformed note id: {file}"))?;
-    run_qmd(&["update", "-c", coll])?;
-    Ok(())
+    reindex_collections(&[coll.to_string()])
 }
 
-/// Rename / move a note. `from` and `to` are qmd note ids
-/// ("collection/path.md"). The file is moved on disk (refusing to overwrite an
-/// existing destination), then both the source and destination collections are
-/// reindexed with `qmd update -c <name>` so the move is reflected in search.
-pub fn rename_note(from: &str, to: &str) -> Result<(), String> {
-    // Resolve the source absolute path via multi-get --full-path.
-    let (_, abs) = get_body(from)?;
-    let src_abs = match abs {
-        Some(p) => p,
-        None => return Err(format!("could not resolve path for {from}")),
-    };
-    // Parse the destination "<collection>/<path>".
-    let (coll, rel) = match to.split_once('/') {
-        Some((c, p)) if !c.is_empty() && !p.is_empty() => (c.to_string(), p.to_string()),
-        _ => return Err("use '<collection>/<path>.md' format".into()),
-    };
-    let file_name = if rel.ends_with(".md") {
-        rel
-    } else {
-        format!("{rel}.md")
-    };
-    // Destination collection directory.
-    let colls = list_collections()?;
-    let dst_dir = match colls.iter().find(|(n, _)| n == &coll) {
-        Some((_, p)) => p.clone(),
-        None => return Err(format!("unknown collection '{coll}'")),
-    };
-    let dst_abs = dst_dir.join(&file_name);
+/// Move `src_abs` to `dst_abs`, creating the destination directory as needed
+/// and refusing to clobber an existing destination. Instant; safe to call on
+/// the UI thread. Reindexing the affected collections is a separate, slower
+/// step — see `reindex_collections_async`.
+pub fn move_file(src_abs: &Path, dst_abs: &Path) -> Result<(), String> {
     if dst_abs.exists() {
-        return Err(format!("destination already exists: {to}"));
+        return Err(format!("destination already exists: {}", dst_abs.display()));
     }
     if let Some(parent) = dst_abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
     }
-    std::fs::rename(&src_abs, &dst_abs).map_err(|e| format!("rename failed: {e}"))?;
-    // Reindex affected collections: drop the old path from the source collection
-    // and index the new path in the destination collection.
-    let src_coll = from
-        .split('/')
-        .next()
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| format!("malformed note id: {from}"))?;
-    let mut to_update: Vec<&str> = Vec::new();
-    if src_coll != coll {
-        to_update.push(src_coll);
-    }
-    to_update.push(&coll);
-    for c in to_update {
-        run_qmd(&["update", "-c", c])?;
-    }
-    Ok(())
+    std::fs::rename(src_abs, dst_abs).map_err(|e| format!("rename failed: {e}"))
 }
 
-/// Duplicate a note into a new file in the same collection, returning the new
-/// note id ("collection/path.md"). The body (with no line numbers) is copied
-/// verbatim from the source, and the new file is reindexed with
-/// `qmd update --path <abs>` so it shows up immediately. The destination name
-/// is `<stem> copy.md`, or `<stem> copy N.md` when that already exists, so a
-/// duplicate never overwrites an existing note.
-pub fn duplicate_note(file: &str) -> Result<String, String> {
-    let (body, abs) = get_body(file)?;
-    let src_abs = match abs {
-        Some(p) => p,
-        None => return Err(format!("could not resolve path for {file}")),
-    };
+/// Write `body` to a fresh "<stem> copy.md" (or "<stem> copy N.md") path next
+/// to `src_abs` and return it — the destination name comes from
+/// `unique_copy_name`, so a duplicate never overwrites an existing note.
+/// Instant; safe to call on the UI thread. Reindexing the new file is a
+/// separate, slower step — see `reindex_path_async`.
+pub fn duplicate_file(src_abs: &Path, body: &str) -> Result<PathBuf, String> {
     let coll_dir = src_abs
         .parent()
-        .ok_or_else(|| format!("no parent dir for {file}"))?
-        .to_path_buf();
+        .ok_or_else(|| format!("no parent dir for {}", src_abs.display()))?;
     let base = src_abs
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("invalid filename for {file}"))?
-        .to_string();
-    let dest = unique_copy_name(&coll_dir, &base);
+        .ok_or_else(|| format!("invalid filename for {}", src_abs.display()))?;
+    let dest = unique_copy_name(coll_dir, base);
     let dest_abs = coll_dir.join(&dest);
-    std::fs::write(&dest_abs, &body).map_err(|e| format!("write failed: {e}"))?;
-    let dest_str = dest_abs.to_string_lossy();
-    run_qmd(&["update", "--path", &dest_str])?;
-    // New note id = "<collection>/<dest filename>".
-    let coll = file
-        .split('/')
-        .next()
-        .filter(|c| !c.is_empty())
-        .unwrap_or("")
-        .to_string();
-    Ok(format!("{}/{}", coll, dest))
+    std::fs::write(&dest_abs, body).map_err(|e| format!("write failed: {e}"))?;
+    Ok(dest_abs)
 }
 
 /// Pick a free "<stem> copy.md" (or "<stem> copy N.md") name within `dir`.
@@ -391,6 +345,29 @@ pub fn reindex_path_async(
     rx
 }
 
+/// Reindex one or more collections (`qmd update -c <name>`, once per name).
+/// Slow (~1s each: Node CLI startup), so callers that care about UI latency
+/// spawn it on a thread via `reindex_collections_async`.
+pub fn reindex_collections(names: &[String]) -> Result<(), String> {
+    for name in names {
+        run_qmd(&["update", "-c", name])?;
+    }
+    Ok(())
+}
+
+/// Spawn `reindex_collections` on a background thread; poll the returned
+/// receiver from the event loop to collect the result without blocking the
+/// UI.
+pub fn reindex_collections_async(
+    names: Vec<String>,
+) -> std::sync::mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(reindex_collections(&names));
+    });
+    rx
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct CollectionJson {
     name: String,
@@ -409,9 +386,11 @@ pub fn list_collections() -> Result<Vec<(String, PathBuf)>, String> {
         .collect())
 }
 
-/// Create a new note file inside `collection_dir`, then reindex just that file so
-/// it appears in search immediately. Returns the absolute path written.
-pub fn create_note(
+/// Write `content` into `collection_dir/file_name` (creating parent
+/// directories as needed) and return the absolute path. Instant; safe to call
+/// on the UI thread. Reindexing is a separate, slower step — see
+/// `reindex_path_async`.
+pub fn create_file(
     collection_dir: &Path,
     file_name: &str,
     content: &str,
@@ -421,8 +400,22 @@ pub fn create_note(
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
     }
     std::fs::write(&abs, content).map_err(|e| format!("write failed: {e}"))?;
-    let abs_str = abs.to_string_lossy();
-    run_qmd(&["update", "--path", &abs_str])?;
+    Ok(abs)
+}
+
+/// Create a new note file inside `collection_dir`, then reindex just that file so
+/// it appears in search immediately. Returns the absolute path written.
+/// Synchronous end-to-end; the app itself writes via `create_file` and
+/// reindexes on a background thread instead (see `App::confirm_create`) —
+/// this combo is only used by tests, hence `#[cfg(test)]`.
+#[cfg(test)]
+pub fn create_note(
+    collection_dir: &Path,
+    file_name: &str,
+    content: &str,
+) -> Result<PathBuf, String> {
+    let abs = create_file(collection_dir, file_name, content)?;
+    reindex_path(&abs)?;
     Ok(abs)
 }
 
@@ -536,6 +529,73 @@ mod tests {
         let raw = r#"[{"file":"t/bar.md","title":"Bar"}]"#;
         let parsed: Vec<NotesJson> = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed[0].mtime, "", "mtime defaults to empty string");
+    }
+
+    // delete_file removes an existing file and errors (without panicking) on
+    // a missing one — the sync, UI-thread-safe half of what delete_note used
+    // to do in one shell-out-plus-remove call.
+    #[test]
+    fn delete_file_removes_existing_file() {
+        let dir = std::env::temp_dir().join(format!("qmd-tui-delfile-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("gone.md");
+        std::fs::write(&f, "bye").unwrap();
+        assert!(delete_file(&f).is_ok());
+        assert!(!f.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_file_missing_file_errors() {
+        let f = std::env::temp_dir()
+            .join(format!("qmd-tui-delfile-missing-{}.md", std::process::id()));
+        assert!(delete_file(&f).is_err());
+    }
+
+    // duplicate_file writes the body to a fresh "<stem> copy.md" path (via
+    // unique_copy_name) and returns it — no qmd shell-out, so the copy lands
+    // on disk instantly; reindexing is a separate, async step.
+    #[test]
+    fn duplicate_file_writes_unique_copy_with_same_body() {
+        let dir = std::env::temp_dir().join(format!("qmd-tui-dupfile-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("note.md");
+        std::fs::write(&src, "# hello\nbody\n").unwrap();
+        let dest = duplicate_file(&src, "# hello\nbody\n").unwrap();
+        assert_eq!(dest, dir.join("note copy.md"));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "# hello\nbody\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // create_file writes content into a (possibly new) directory and returns
+    // the absolute path — the sync half of create_note, with reindexing left
+    // to the caller to run asynchronously.
+    #[test]
+    fn create_file_writes_content_without_reindex() {
+        let dir = std::env::temp_dir().join(format!("qmd-tui-createfile-{}", std::process::id()));
+        let abs = create_file(&dir, "new.md", "# new\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&abs).unwrap(), "# new\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // move_file relocates a file (creating the destination dir if needed) and
+    // refuses to clobber an existing destination — the sync half of
+    // rename_note, with reindexing left to the caller to run asynchronously.
+    #[test]
+    fn move_file_relocates_and_refuses_overwrite() {
+        let dir = std::env::temp_dir().join(format!("qmd-tui-movefile-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("a.md");
+        std::fs::write(&src, "content").unwrap();
+        let dst = dir.join("sub/b.md");
+        move_file(&src, &dst).unwrap();
+        assert!(!src.exists(), "source removed after move");
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "content");
+
+        // Refuses to overwrite an existing destination.
+        std::fs::write(&src, "other").unwrap();
+        assert!(move_file(&src, &dst).is_err(), "must refuse to clobber");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // unique_copy_name picks "<stem> copy.md" when free, and "<stem> copy N.md"

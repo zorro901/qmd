@@ -61,6 +61,14 @@
   nothing. It now says `type a filename after '<collection>/' (e.g.
   note.md), then Enter`.
 
+- `qmd tui`: duplicate (`y`), delete (`d`), create (`n`/`+`), and rename (`r`)
+  no longer freeze the UI. Each now does its on-disk change (write, remove,
+  or rename — all effectively instant) directly, then reindexes on a
+  background thread the same way save/autosave already did, so the ~1-1.7s
+  `qmd update` startup per action no longer blocks typing or scrolling.
+  Creating a note also no longer shells out to `qmd collection list` on every
+  `n` press; it reuses the collection list warmed once at startup.
+
 ## [2.8.3] - 2026-08-16
 
 ### Security

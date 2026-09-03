@@ -117,6 +117,17 @@ enum Confirm {
 /// per character.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
+/// What triggered a background reindex, so `poll_reindex` knows whether to
+/// overwrite the status line with "saved" once it lands. Save/autosave want
+/// that message; duplicate/delete/create/rename already set their own status
+/// (e.g. "duplicated to ...") before the reindex started and it must not be
+/// clobbered when the reindex finishes after the user has moved on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReindexKind {
+    Save,
+    Other,
+}
+
 struct App {
     notes: Vec<qmd::Note>,
     list_state: ListState,
@@ -180,11 +191,14 @@ struct App {
     /// Instant of the last keystroke while editing; used to debounce autosave so
     /// we don't shell out to qmd on every single character.
     last_edit: Option<Instant>,
-    /// Set while a background thread is reindexing after a save. The write
-    /// itself is synchronous (instant); only the `qmd update --path` child is
-    /// slow (~1s Node startup), so it runs off-thread and the UI never blocks.
-    /// The next event-loop tick collects the result and refreshes the list.
-    reindex_in_flight: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// Set while a background thread is reindexing after a save, duplicate,
+    /// delete, create, or rename. The on-disk change itself is always
+    /// synchronous (instant: write/remove/rename); only the `qmd update`
+    /// child is slow (~1s Node startup), so it runs off-thread and the UI
+    /// never blocks. The next event-loop tick collects the result and
+    /// refreshes the list. Tagged with `ReindexKind` so `poll_reindex` only
+    /// overwrites the status line with "saved" for the save/autosave path.
+    reindex_in_flight: Option<(ReindexKind, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// Set while a background thread fetches a note body for the preview pane
     /// (`qmd multi-get`, ~0.5-1s). Keeps the UI responsive during clicks/keys:
     /// the event loop collects the body when it lands and fills the pane then.
@@ -584,6 +598,21 @@ impl App {
         self.preview_selected();
     }
 
+    /// Resolve a note id to its absolute on-disk path, preferring the cached
+    /// collection list (nanoseconds, no shell-out — see `note_abs_path`) and
+    /// only falling back to a synchronous `qmd multi-get` when the cache
+    /// isn't loaded yet or can't map the id. Shared by every note-mutating
+    /// action (duplicate/delete/rename) so they get instant path resolution
+    /// on the common path instead of paying a ~1s CLI startup each time.
+    fn resolve_note_path(&self, file: &str) -> Option<std::path::PathBuf> {
+        if self.collections_loaded {
+            if let Some(abs) = qmd::note_abs_path(file, &self.collections) {
+                return Some(abs);
+            }
+        }
+        qmd::get_body(file).ok().and_then(|(_, abs)| abs)
+    }
+
     /// Arm a deletion confirmation for the selected note. Deletion is destructive
     /// (removes the file from disk), so it always requires an explicit Enter.
     fn arm_delete(&mut self) {
@@ -604,7 +633,8 @@ impl App {
 
     /// Duplicate the selected note into a new file in the same collection. This
     /// is non-destructive (creates a copy), so it does not need a confirm guard.
-    /// After duplicating, the list is refreshed and the copy is selected + opened.
+    /// The copy itself (path resolve + read + write) is instant; only the
+    /// reindex that makes it searchable runs in the background, same as save.
     fn duplicate_selected(&mut self) {
         let idx = match self.list_state.selected() {
             Some(i) => i,
@@ -620,9 +650,32 @@ impl App {
                 return;
             }
         };
-        match qmd::duplicate_note(&note.file) {
-            Ok(new_id) => {
-                self.status = format!("duplicated to {new_id}");
+        let src_abs = match self.resolve_note_path(&note.file) {
+            Some(p) => p,
+            None => {
+                self.status = format!("duplicate error: could not resolve path for {}", note.file);
+                return;
+            }
+        };
+        let body = match std::fs::read_to_string(&src_abs) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("duplicate error: {e}");
+                return;
+            }
+        };
+        match qmd::duplicate_file(&src_abs, &body) {
+            Ok(dest_abs) => {
+                let coll = note.file.split('/').next().unwrap_or("").to_string();
+                let dest_name = dest_abs
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let new_id = format!("{coll}/{dest_name}");
+                self.status = format!("duplicated to {new_id} — reindexing…");
+                self.reindex_in_flight =
+                    Some((ReindexKind::Other, qmd::reindex_path_async(dest_abs)));
                 // Background refresh; the copy is selected + previewed when
                 // the fresh list arrives (or now if it is already present).
                 self.reload_notes_async();
@@ -636,7 +689,9 @@ impl App {
         }
     }
 
-    /// Actually delete the previously selected note and refresh the list.
+    /// Actually delete the previously selected note and refresh the list. The
+    /// on-disk removal is instant; only the reindex that drops it from search
+    /// runs in the background, same as save.
     fn delete_selected(&mut self) {
         let idx = match self.list_state.selected() {
             Some(i) => i,
@@ -646,7 +701,14 @@ impl App {
             Some(n) => n.clone(),
             None => return,
         };
-        match qmd::delete_note(&note.file) {
+        let abs = match self.resolve_note_path(&note.file) {
+            Some(p) => p,
+            None => {
+                self.status = format!("delete error: could not resolve path for {}", note.file);
+                return;
+            }
+        };
+        match qmd::delete_file(&abs) {
             Ok(()) => {
                 // If the deleted note was open, close the pane.
                 if self.open_file.as_deref() == Some(&note.file) {
@@ -656,7 +718,12 @@ impl App {
                     self.dirty = false;
                     self.edit_mode = false;
                 }
-                self.status = format!("deleted {}", note.file);
+                self.status = format!("deleted {} — reindexing…", note.file);
+                let coll = note.file.split('/').next().unwrap_or("").to_string();
+                self.reindex_in_flight = Some((
+                    ReindexKind::Other,
+                    qmd::reindex_collections_async(vec![coll]),
+                ));
                 // Background refresh: deletion already removed the file, so
                 // the UI must stay responsive while the index catches up.
                 self.reload_notes_async();
@@ -719,24 +786,35 @@ impl App {
     }
 
     /// Begin creating a new note: pick a collection (the active filtered one if
-    /// set, else the first), then prompt for a filename in `new_input`.
+    /// set, else the first), then prompt for a filename in `new_input`. Uses
+    /// the collection list warmed once at startup instead of shelling out to
+    /// `qmd collection list` on every 'n' press.
     fn start_create(&mut self) {
-        match qmd::list_collections() {
-            Ok(colls) if !colls.is_empty() => {
-                // Prefer the active collection filter, else the first one.
-                let preferred = self
-                    .collection
-                    .as_deref()
-                    .and_then(|c| colls.iter().find(|(n, _)| n == c))
-                    .or_else(|| colls.first());
-                if let Some((name, _)) = preferred {
-                    self.new_input = format!("{name}/");
-                    self.creating = true;
-                    self.status = "new note — type a filename, Enter to create".into();
+        let colls: Vec<(String, std::path::PathBuf)> = if self.collections_loaded {
+            self.collections.clone()
+        } else {
+            match qmd::list_collections() {
+                Ok(c) => c,
+                Err(e) => {
+                    self.status = format!("error: {e}");
+                    return;
                 }
             }
-            Ok(_) => self.status = "no collections; run 'qmd collection add .' first".into(),
-            Err(e) => self.status = format!("error: {e}"),
+        };
+        if colls.is_empty() {
+            self.status = "no collections; run 'qmd collection add .' first".into();
+            return;
+        }
+        // Prefer the active collection filter, else the first one.
+        let preferred = self
+            .collection
+            .as_deref()
+            .and_then(|c| colls.iter().find(|(n, _)| n == c))
+            .or_else(|| colls.first());
+        if let Some((name, _)) = preferred {
+            self.new_input = format!("{name}/");
+            self.creating = true;
+            self.status = "new note — type a filename, Enter to create".into();
         }
     }
 
@@ -771,11 +849,15 @@ impl App {
             format!("{rel}.md")
         };
 
-        let colls = match qmd::list_collections() {
-            Ok(c) => c,
-            Err(e) => {
-                self.status = format!("error: {e}");
-                return;
+        let colls: Vec<(String, std::path::PathBuf)> = if self.collections_loaded {
+            self.collections.clone()
+        } else {
+            match qmd::list_collections() {
+                Ok(c) => c,
+                Err(e) => {
+                    self.status = format!("error: {e}");
+                    return;
+                }
             }
         };
         let dir = match colls.iter().find(|(n, _)| n == &coll_name) {
@@ -786,15 +868,18 @@ impl App {
             }
         };
 
-        match qmd::create_note(&dir, &file_name, "") {
+        // Write is instant; only the reindex that makes the note searchable
+        // is slow, so it runs in the background like save/autosave.
+        match qmd::create_file(&dir, &file_name, "") {
             Ok(abs) => {
                 self.open_file = Some(format!("{coll_name}/{file_name}"));
                 self.open_body = String::new();
-                self.open_abs = Some(abs);
+                self.open_abs = Some(abs.clone());
                 self.textarea = TextArea::default();
                 self.edit_mode = true;
                 self.dirty = true;
-                self.status = "new note — Ctrl-S save".into();
+                self.status = "new note — Ctrl-S save — reindexing…".into();
+                self.reindex_in_flight = Some((ReindexKind::Other, qmd::reindex_path_async(abs)));
             }
             Err(e) => self.status = format!("create error: {e}"),
         }
@@ -841,20 +926,67 @@ impl App {
             self.status = "rename cancelled".into();
             return;
         }
-        match qmd::rename_note(&from, &raw) {
+        let src_abs = match self.resolve_note_path(&from) {
+            Some(p) => p,
+            None => {
+                self.status = format!("rename error: could not resolve path for {from}");
+                return;
+            }
+        };
+        // Parse the destination "<collection>/<path>".
+        let (coll, rel) = match raw.split_once('/') {
+            Some((c, p)) if !c.is_empty() && !p.is_empty() => (c.to_string(), p.to_string()),
+            _ => {
+                self.status = "use '<collection>/<path>.md' format".into();
+                return;
+            }
+        };
+        let file_name = if rel.ends_with(".md") {
+            rel
+        } else {
+            format!("{rel}.md")
+        };
+        let colls: Vec<(String, std::path::PathBuf)> = if self.collections_loaded {
+            self.collections.clone()
+        } else {
+            match qmd::list_collections() {
+                Ok(c) => c,
+                Err(e) => {
+                    self.status = format!("error: {e}");
+                    return;
+                }
+            }
+        };
+        let dst_dir = match colls.iter().find(|(n, _)| n == &coll) {
+            Some((_, p)) => p.clone(),
+            None => {
+                self.status = format!("unknown collection '{coll}'");
+                return;
+            }
+        };
+        let dst_abs = dst_dir.join(&file_name);
+        // The move itself is instant; only the reindex (drop the old path,
+        // index the new one) runs in the background, same as save.
+        match qmd::move_file(&src_abs, &dst_abs) {
             Ok(()) => {
-                self.status = format!("renamed to {raw}");
+                self.status = format!("renamed to {raw} — reindexing…");
                 // If the moved note was open, point the open pane at the new id.
                 if self.open_file.as_deref() == Some(&from) {
                     self.open_file = Some(raw.clone());
-                    // open_abs is stale after the move; re-resolve purely
-                    // (collection root + new relative path), no shell-out.
-                    if self.collections_loaded {
-                        self.open_abs = qmd::note_abs_path(&raw, &self.collections);
-                    } else if let Ok((_, abs)) = qmd::get_body(&raw) {
-                        self.open_abs = abs;
-                    }
+                    self.open_abs = Some(dst_abs);
                 }
+                // Reindex affected collections: drop the old path from the
+                // source collection and index the new path in the destination.
+                let src_coll = from.split('/').next().unwrap_or("").to_string();
+                let mut to_update = Vec::new();
+                if src_coll != coll {
+                    to_update.push(src_coll);
+                }
+                to_update.push(coll);
+                self.reindex_in_flight = Some((
+                    ReindexKind::Other,
+                    qmd::reindex_collections_async(to_update),
+                ));
                 // Background refresh; the renamed note is re-selected when the
                 // fresh list arrives (or now if already present).
                 self.reload_notes_async();
@@ -901,7 +1033,7 @@ impl App {
                 self.edit_mode = false;
                 self.last_edit = None;
                 self.status = "saved — reindexing…".into();
-                self.reindex_in_flight = Some(qmd::reindex_path_async(abs));
+                self.reindex_in_flight = Some((ReindexKind::Save, qmd::reindex_path_async(abs)));
                 // Keep the just-saved note selected in the list; the body and
                 // title in the list refresh when the background reindex lands.
             }
@@ -916,12 +1048,17 @@ impl App {
         // try_recv() consumes the message, so take the receiver FIRST and use
         // the value from that single recv attempt (doing a probe-recv and then
         // another recv would lose the result).
-        let Some(rx) = self.reindex_in_flight.take() else {
+        let Some((kind, rx)) = self.reindex_in_flight.take() else {
             return;
         };
         match rx.try_recv() {
             Ok(Ok(())) => {
-                self.status = "saved".into();
+                // Only the save/autosave path wants "saved" on the status line;
+                // duplicate/delete/create/rename already set their own status
+                // before the reindex started and it must not be clobbered here.
+                if kind == ReindexKind::Save {
+                    self.status = "saved".into();
+                }
                 // Background refresh: the ~1s `qmd notes` shell-out must not
                 // freeze the event loop right after every save/autosave.
                 self.reload_notes_async();
@@ -933,7 +1070,9 @@ impl App {
             }
             Ok(Err(e)) => self.status = format!("reindex error: {e}"),
             // Still running: put the receiver back for the next tick.
-            Err(std::sync::mpsc::TryRecvError::Empty) => self.reindex_in_flight = Some(rx),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.reindex_in_flight = Some((kind, rx))
+            }
             // Thread died without sending (shouldn't happen); drop it.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
@@ -1009,7 +1148,7 @@ impl App {
                 self.open_body = content;
                 self.dirty = false;
                 self.status = "autosaved — reindexing…".into();
-                self.reindex_in_flight = Some(qmd::reindex_path_async(abs));
+                self.reindex_in_flight = Some((ReindexKind::Save, qmd::reindex_path_async(abs)));
             }
             Err(e) => self.status = format!("autosave error: {e}"),
         }
@@ -2053,6 +2192,9 @@ mod app_tests {
         app.rename_input = new_id.clone();
         app.confirm_rename();
         assert!(!app.renaming, "rename prompt closed after apply");
+        // The move on disk is synchronous; the reindex that updates the
+        // external `qmd list_notes` view below runs in the background.
+        drain_reindex(&mut app);
 
         let listed = qmd::list_notes(Some(&coll)).unwrap_or_default();
         let under_new = listed.iter().any(|n| n.file == new_id);
@@ -2104,6 +2246,10 @@ mod app_tests {
         app.list_state.select(Some(idx));
 
         app.handle_key(key('y'));
+        // The copy is written synchronously; the reindex that updates the
+        // external `qmd list_notes`/`get_body` views below runs in the
+        // background.
+        drain_reindex(&mut app);
 
         let listed = qmd::list_notes(Some(&coll)).unwrap_or_default();
         let copy_stem = base.trim_end_matches(".md");
