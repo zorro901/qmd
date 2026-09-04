@@ -373,7 +373,13 @@ impl App {
             } else {
                 self.preview_selected();
             }
-        } else {
+        } else if !self.edit_mode {
+            // Don't blow away an in-progress edit just because this refresh's
+            // note list came back empty (e.g. a just-created note with no
+            // content yet has nothing to index, so it legitimately doesn't
+            // show up until the next reindex after it has real content).
+            // Clearing open_abs/open_file here would make save_edit() fail
+            // with "no note open" and silently drop everything the user typed.
             self.list_state.select(None);
             self.open_file = None;
             self.open_body.clear();
@@ -491,7 +497,10 @@ impl App {
                     .map(|i| i + 1)
                     .unwrap_or(0);
             }
-            Err(_) => self.collections = Vec::new(),
+            Err(e) => {
+                self.collections = Vec::new();
+                self.status = format!("collection list failed: {e}");
+            }
         }
     }
 
