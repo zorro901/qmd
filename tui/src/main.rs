@@ -1184,6 +1184,32 @@ impl App {
     /// Handle a key event. Returns true when the app should quit. Centralized
     /// here so the logic is unit-testable without a terminal.
     fn handle_key(&mut self, key: event::KeyEvent) -> bool {
+        // TEMPORARY diagnostic: append every raw key event to a file so we can
+        // confirm what actually reaches the TUI regardless of whether the
+        // on-screen status/title update is visible. Remove once the 'n'/'+'
+        // investigation is resolved.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/qmd-tui-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "key={:?} creating={} renaming={} searching={} edit_mode={} picking={} show_help={} confirm_pending={} collections_loaded={} collections={}",
+                key,
+                self.creating,
+                self.renaming,
+                self.searching,
+                self.edit_mode,
+                self.picking,
+                self.show_help,
+                self.confirm_pending.is_some(),
+                self.collections_loaded,
+                self.collections.len(),
+            );
+        }
+
         // Debug echo: remember the raw event so Ctrl-G can surface it on the
         // status bar. This is how we learn which key codes actually reach the
         // TUI on a given terminal (e.g. when Ctrl-X / Alt-X seem dead).
