@@ -176,7 +176,7 @@ struct App {
     picking: bool,
     /// When true, the keybinding help overlay is shown (dismissed by any key).
     show_help: bool,
-    /// When true (toggled with Ctrl-D), the last raw key event is echoed to
+    /// When true (toggled with Ctrl-G), the last raw key event is echoed to
     /// the status bar. Used to diagnose which key codes actually reach the TUI
     /// on a given terminal/SSH setup (e.g. when Ctrl-X or Alt-X appear to do
     /// nothing).
@@ -1184,16 +1184,18 @@ impl App {
     /// Handle a key event. Returns true when the app should quit. Centralized
     /// here so the logic is unit-testable without a terminal.
     fn handle_key(&mut self, key: event::KeyEvent) -> bool {
-        // Debug echo: remember the raw event so Ctrl-D can surface it on the
+        // Debug echo: remember the raw event so Ctrl-G can surface it on the
         // status bar. This is how we learn which key codes actually reach the
         // TUI on a given terminal (e.g. when Ctrl-X / Alt-X seem dead).
         self.last_key = format!("{:?}", key);
 
-        // Ctrl-D toggles the key debug echo. F12 was tried first, but function
+        // Ctrl-G toggles the key debug echo. F12 was tried first, but function
         // keys are routinely swallowed by the terminal/OS/multiplexer before
         // reaching the TUI — exactly the terminals a debug toggle exists to
-        // diagnose. Ctrl-D is not bound to anything else outside edit mode.
-        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // diagnose. Ctrl-D was tried next, but it's already claimed by some
+        // terminals/shells (e.g. EOF) before it reaches the TUI. Ctrl-G is not
+        // bound to anything else outside edit mode.
+        if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.debug_keys = !self.debug_keys;
             self.status = if self.debug_keys {
                 "key debug on — last key shown in status".into()
@@ -3017,21 +3019,22 @@ mod app_tests {
         assert!(!app.edit_mode, "Ctrl-C drops out of edit mode");
     }
 
-    // Ctrl-D toggles the key-debug echo and the last raw key is recorded. Used
+    // Ctrl-G toggles the key-debug echo and the last raw key is recorded. Used
     // to diagnose which key codes reach the TUI on a given terminal (F12 was
     // dropped: many terminals/OSes intercept function keys before they ever
     // reach the TUI, making it useless as a diagnostic for exactly the
-    // terminals that need one).
+    // terminals that need one. Ctrl-D was tried next but some
+    // terminals/shells claim it — e.g. as EOF — before it reaches the TUI).
     #[test]
-    fn ctrl_d_toggles_key_debug() {
+    fn ctrl_g_toggles_key_debug() {
         let mut app = App::new();
         assert!(!app.debug_keys, "debug off initially");
-        app.handle_key(event::KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        assert!(app.debug_keys, "Ctrl-D turns debug on");
+        app.handle_key(event::KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(app.debug_keys, "Ctrl-G turns debug on");
         app.handle_key(key('x'));
         assert!(app.last_key.contains("Char('x')"), "last key recorded: {}", app.last_key);
-        app.handle_key(event::KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        assert!(!app.debug_keys, "Ctrl-D turns debug off");
+        app.handle_key(event::KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(!app.debug_keys, "Ctrl-G turns debug off");
     }
 
     // Body scroll clamps: never negative, never past the last visible line for a

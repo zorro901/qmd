@@ -42,10 +42,11 @@
   polling, tagged by generation/query so a stale fetch superseded by a newer
   reload or keystroke is dropped instead of clobbering the list.
 
-- `qmd tui`: the key-debug toggle moved from F12 to Ctrl-D. F12 is routinely
+- `qmd tui`: the key-debug toggle moved from F12 to Ctrl-G. F12 is routinely
   intercepted by the terminal, OS, or multiplexer before it reaches the TUI —
   exactly the terminals where a "what key did you actually send" diagnostic is
-  needed.
+  needed. Ctrl-D was tried next but is claimed by some terminals/shells (e.g.
+  as EOF) before it reaches the TUI.
 
 - `qmd tui`: live search highlighting no longer lags behind typing. The async
   note-list/search change (above) moved the highlight query update into the
