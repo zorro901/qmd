@@ -18,6 +18,12 @@
   executable (the tarball ships the binary, not the `tui/` sources, so a
   non-executable staging step would break `qmd tui` out of the box).
 
+- `qmd tui`: press `a` to add a collection without leaving the TUI. It prompts
+  for a directory path; Enter runs `qmd collection add <path>` on a background
+  thread (indexing a fresh directory from scratch can take far longer than a
+  routine `qmd update`, so it never blocks the UI) and refreshes the
+  collection and note lists once it lands.
+
 ### Fixed
 
 - `qmd tui`: clicking a note now selects it instantly. Previously every click
@@ -47,6 +53,12 @@
   exactly the terminals where a "what key did you actually send" diagnostic is
   needed. Ctrl-D was tried next but is claimed by some terminals/shells (e.g.
   as EOF) before it reaches the TUI.
+
+- `qmd tui`: removed the temporary every-keypress diagnostic log
+  (`/tmp/qmd-tui-debug.log`) added while investigating `n`/`+` appearing
+  unresponsive; the root cause (an empty note list from a fresh/empty
+  collection wiping `edit_mode`/`open_file` state) is fixed, so the log's
+  per-key disk write no longer needs to run in production.
 
 - `qmd tui`: live search highlighting no longer lags behind typing. The async
   note-list/search change (above) moved the highlight query update into the

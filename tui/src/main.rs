@@ -15,6 +15,7 @@
 //!   c              switch collection (filter the list/notes)
 //!   ?              show keybindings
 //!   n / +          create a new note (enter "<collection>/<file>.md")
+//!   a              add a collection (enter a directory path; runs `qmd collection add`)
 //!   r              rename / move the selected note ("<collection>/<file>.md")
 //!   y              duplicate the selected note into a copy (same collection)
 //!   e              edit the open note inline (tui-textarea)
@@ -230,6 +231,15 @@ struct App {
     /// Instant preview needs it to map note ids to on-disk paths; until then
     /// preview falls back to the async `qmd multi-get` fetch.
     collections_loaded: bool,
+    /// When true, the add-collection path prompt is active (edits go to
+    /// `add_collection_input`). `a` arms this.
+    adding_collection: bool,
+    add_collection_input: String,
+    /// Set while a background thread runs `qmd collection add <path>`.
+    /// Indexing a fresh directory from scratch can take far longer than a
+    /// routine `qmd update`, so this always runs off-thread; the event loop
+    /// collects the result and refreshes the collection + note lists.
+    add_collection_in_flight: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 }
 
 impl App {
@@ -277,6 +287,9 @@ impl App {
             search_refresh_queued: false,
             pending_select: None,
             collections_loaded: false,
+            adding_collection: false,
+            add_collection_input: String::new(),
+            add_collection_in_flight: None,
         };
         // Warm the collection cache synchronously ONCE at startup (~1s at
         // launch, acceptable) so instant preview can map note ids to on-disk
@@ -1009,6 +1022,53 @@ impl App {
         }
     }
 
+    /// Begin adding a new collection: prompt for a directory path in
+    /// `add_collection_input`.
+    fn start_add_collection(&mut self) {
+        self.adding_collection = true;
+        self.add_collection_input.clear();
+        self.status = "add collection — type a path, Enter to add".into();
+    }
+
+    /// Finish the add-collection path prompt: run `qmd collection add <path>`
+    /// on a background thread. Indexing a fresh directory from scratch can
+    /// take far longer than a routine `qmd update`, so this never runs on the
+    /// UI thread; `poll_add_collection` collects the result.
+    fn confirm_add_collection(&mut self) {
+        let raw = self.add_collection_input.trim().to_string();
+        self.adding_collection = false;
+        self.add_collection_input.clear();
+        if raw.is_empty() {
+            self.status = "cancelled".into();
+            return;
+        }
+        self.status = format!("adding collection at {raw} — this can take a while…");
+        self.add_collection_in_flight = Some(qmd::add_collection_async(raw));
+    }
+
+    /// Poll an in-flight `qmd collection add`, if any. Called every event-loop
+    /// tick; when the child finishes we refresh the collection and note lists
+    /// so the new collection's files show up immediately.
+    fn poll_add_collection(&mut self) {
+        let Some(rx) = self.add_collection_in_flight.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.status = "collection added".into();
+                self.load_collections();
+                self.reload_notes_async();
+            }
+            Ok(Err(e)) => self.status = format!("add collection error: {e}"),
+            // Still running: put the receiver back for the next tick.
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.add_collection_in_flight = Some(rx);
+            }
+            // Thread died without sending (shouldn't happen); drop it.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+
     /// Persist the inline edit: write the file, then reindex just that file.
     fn save_edit(&mut self) {
         // Resolve the absolute on-disk path. Prefer the cached `open_abs` (set on
@@ -1193,32 +1253,6 @@ impl App {
     /// Handle a key event. Returns true when the app should quit. Centralized
     /// here so the logic is unit-testable without a terminal.
     fn handle_key(&mut self, key: event::KeyEvent) -> bool {
-        // TEMPORARY diagnostic: append every raw key event to a file so we can
-        // confirm what actually reaches the TUI regardless of whether the
-        // on-screen status/title update is visible. Remove once the 'n'/'+'
-        // investigation is resolved.
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/qmd-tui-debug.log")
-        {
-            use std::io::Write;
-            let _ = writeln!(
-                f,
-                "key={:?} creating={} renaming={} searching={} edit_mode={} picking={} show_help={} confirm_pending={} collections_loaded={} collections={}",
-                key,
-                self.creating,
-                self.renaming,
-                self.searching,
-                self.edit_mode,
-                self.picking,
-                self.show_help,
-                self.confirm_pending.is_some(),
-                self.collections_loaded,
-                self.collections.len(),
-            );
-        }
-
         // Debug echo: remember the raw event so Ctrl-G can surface it on the
         // status bar. This is how we learn which key codes actually reach the
         // TUI on a given terminal (e.g. when Ctrl-X / Alt-X seem dead).
@@ -1421,6 +1455,24 @@ impl App {
             return false;
         }
 
+        // Add-collection path prompt captures keys.
+        if self.adding_collection {
+            match key.code {
+                KeyCode::Enter => self.confirm_add_collection(),
+                KeyCode::Esc => {
+                    self.adding_collection = false;
+                    self.add_collection_input.clear();
+                    self.status = "cancelled".into();
+                }
+                KeyCode::Char(c) => self.add_collection_input.push(c),
+                KeyCode::Backspace => {
+                    self.add_collection_input.pop();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         match key.code {
             KeyCode::Char('q') => return self.quit(),
             KeyCode::Char('/') => self.searching = true,
@@ -1431,6 +1483,7 @@ impl App {
             KeyCode::Char('e') => self.start_edit(),
             KeyCode::Char('n') => self.start_create(),
             KeyCode::Char('+') => self.start_create(),
+            KeyCode::Char('a') => self.start_add_collection(),
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => self.start_rename(),
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => self.save_edit(),
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1715,6 +1768,8 @@ fn run_app<B: ratatui::backend::Backend>(
         // Collect finished background list refreshes / live searches.
         app.poll_list();
         app.poll_search();
+        // Collect a finished `qmd collection add`, if any.
+        app.poll_add_collection();
     }
     Ok(())
 }
@@ -1837,6 +1892,7 @@ const HELP_LINES: &[(&str, &str)] = &[
     ("↑ ↓ / j k", "move through the note list; the body previews as you go (g top · G bottom)"),
     ("c", "switch collection (filter list + search)"),
     ("n / +", "create a new note (enter \"<collection>/<file>.md\")"),
+    ("a", "add a collection (enter a directory path; runs 'qmd collection add')"),
     ("r", "rename / move the selected note (cross-collection)"),
     ("y", "duplicate the selected note into a copy (same collection)"),
     ("e", "edit the open note inline"),
@@ -1926,12 +1982,18 @@ fn render_list(f: &mut Frame<'_>, app: &mut App, area: Rect) {
             Span::raw(&app.rename_input),
             Span::styled("_", Style::default().fg(Color::Magenta)),
         ])
+    } else if app.adding_collection {
+        Line::from(vec![
+            Span::styled("add collection › ", Style::default().fg(Color::Cyan)),
+            Span::raw(&app.add_collection_input),
+            Span::styled("_", Style::default().fg(Color::Cyan)),
+        ])
     } else {
         // Idle (no active prompt): show a persistent key hint so the main
         // actions are discoverable — there is no on-screen button in a TUI, so
         // the hint acts as the "new note" affordance (+/n, etc.).
         Line::from(vec![Span::styled(
-            "n/+ new  y dup  r rename  d del  e edit  / search  ? help",
+            "n/+ new  a add coll  y dup  r rename  d del  e edit  / search  ? help",
             Style::default().fg(Color::DarkGray),
         )])
     };
@@ -2241,6 +2303,53 @@ mod app_tests {
 
         // Clean up the moved file.
         let _ = qmd::delete_note(&new_id);
+    }
+
+    // Add-collection flow (a): the path prompt arms on 'a', accumulates typed
+    // characters, and Esc cancels without touching add_collection_in_flight.
+    // No real `qmd collection add` runs here — CLAUDE.md forbids running that
+    // command automatically, so this only exercises the App state machine.
+    #[test]
+    fn add_collection_key_opens_and_esc_cancels() {
+        let mut app = App::new();
+        assert!(!app.adding_collection);
+        app.handle_key(key('a'));
+        assert!(app.adding_collection, "'a' arms the add-collection prompt");
+        assert!(app.add_collection_input.is_empty());
+
+        for c in "/tmp/notes".chars() {
+            app.handle_key(key(c));
+        }
+        assert_eq!(app.add_collection_input, "/tmp/notes");
+        app.handle_key(event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(app.add_collection_input, "/tmp/note");
+
+        app.handle_key(key_esc());
+        assert!(!app.adding_collection, "esc cancels the prompt");
+        assert!(app.add_collection_input.is_empty(), "esc clears the typed path");
+        assert_eq!(app.status, "cancelled");
+        assert!(
+            app.add_collection_in_flight.is_none(),
+            "esc must never spawn 'qmd collection add'"
+        );
+    }
+
+    // Confirming with a blank (or whitespace-only) path must cancel instead of
+    // shelling out — an empty `qmd collection add ""` would be nonsensical, and
+    // this is the only path in confirm_add_collection that could otherwise run
+    // the command unconditionally.
+    #[test]
+    fn add_collection_empty_confirm_cancels_without_running_qmd() {
+        let mut app = App::new();
+        app.adding_collection = true;
+        app.add_collection_input = "   ".into();
+        app.confirm_add_collection();
+        assert!(!app.adding_collection);
+        assert_eq!(app.status, "cancelled");
+        assert!(
+            app.add_collection_in_flight.is_none(),
+            "blank input must not spawn 'qmd collection add'"
+        );
     }
 
     // Duplicate flow (y): create a note, select it, press y, and verify a copy

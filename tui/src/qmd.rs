@@ -386,6 +386,25 @@ pub fn list_collections() -> Result<Vec<(String, PathBuf)>, String> {
         .collect())
 }
 
+/// Add a new collection at `path` (`qmd collection add <path>`). Slow — this
+/// indexes every file under `path` from scratch (FTS + embeddings), which can
+/// take far longer than a routine `qmd update`. Callers that care about UI
+/// latency should use `add_collection_async`.
+pub fn add_collection(path: &str) -> Result<(), String> {
+    run_qmd(&["collection", "add", path])?;
+    Ok(())
+}
+
+/// Spawn `add_collection` on a background thread; poll the returned receiver
+/// from the event loop to collect the result without blocking the UI.
+pub fn add_collection_async(path: String) -> std::sync::mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(add_collection(&path));
+    });
+    rx
+}
+
 /// Write `content` into `collection_dir/file_name` (creating parent
 /// directories as needed) and return the absolute path. Instant; safe to call
 /// on the UI thread. Reindexing is a separate, slower step — see
